@@ -30,6 +30,7 @@ scaler = MinMaxScaler()
 data['density_normalized'] = scaler.fit_transform(data[['density']])
 poi_data['popularity_normalized'] = scaler.fit_transform(poi_data[['popularity_score']])
 
+
 # --------------------------
 # STEP 2: Feature Engineering
 # --------------------------
@@ -40,6 +41,7 @@ def nearest_poi(lat, lon):
     stop_point = Point(lon, lat)
     nearest = poi_gdf.geometry.apply(lambda x: stop_point.distance(x))
     return nearest.min()
+
 
 data['nearest_poi_dist'] = data.apply(lambda row: nearest_poi(row.Latitude, row.Longitude), axis=1)
 
