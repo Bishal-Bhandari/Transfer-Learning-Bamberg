@@ -1,3 +1,4 @@
+import json
 import osmnx as ox
 import networkx as nx
 import pandas as pd
@@ -11,7 +12,8 @@ import numpy as np
 from shapely.geometry import Point, LineString
 from shapely.ops import nearest_points
 
-#Load OSM Map Data
+
+# Load OSM Map Data
 city_name = "Bamberg, Germany"
 G = ox.graph_from_place(city_name, network_type="drive")
 nodes, edges = ox.graph_to_gdfs(G)
@@ -27,12 +29,17 @@ for geom in road_geometries:
 candidate_stops = pd.DataFrame(candidate_stops, columns=["Longitude", "Latitude"])
 
 # Fetch Weather Data
-API_KEY = "your_openweathermap_api_key"  # Replace with your API key
+# Load API
+with open('api_keys.json') as json_file:
+    api_keys = json.load(json_file)
+
+# Weather API key
+API_KEY = api_keys['Weather_API']['API_key']
+
 WEATHER_API_URL = "http://api.openweathermap.org/data/2.5/weather"
 
 
 def fetch_weather(lat, lon):
-    """Fetch weather data for given latitude and longitude."""
     params = {
         "lat": lat,
         "lon": lon,
