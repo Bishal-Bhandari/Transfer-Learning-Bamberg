@@ -29,7 +29,7 @@ nodes, edges = ox.graph_to_gdfs(G)
 road_geometries = edges["geometry"]
 
 # If bus route data is available in OSM, extract it (optional)
-# bus_routes = ox.features_from_tags(G, {"route": "bus"})
+#bus_routes = ox.features_from_tags(G, {"route": "bus"})
 
 # Generate sample points along the roads as potential bus stop candidates
 candidate_stops = []
@@ -43,17 +43,18 @@ candidate_stops = pd.DataFrame(candidate_stops, columns=["Longitude", "Latitude"
 # STEP 3: Prepare Input Data
 # --------------------------
 # Assume additional datasets like population density and POI exist
-population_density_data = pd.read_excel("BusStop_Density.ods", engine="odf")
-poi_data = pd.read_excel("POI_Data.ods", engine="odf")
+population_density_data = pd.read_excel("Training Data/final_busStop_density.ods", engine="odf")
+poi_data = pd.read_excel("Training Data/osm_poi_rank_data.ods", engine="odf")
 
 # Normalize density and popularity scores
 scaler = MinMaxScaler()
 population_density_data["density_normalized"] = scaler.fit_transform(
-    population_density_data[["density"]]
+    population_density_data[["Density"]]
 )
 poi_data["popularity_normalized"] = scaler.fit_transform(
-    poi_data[["popularity_score"]]
+    poi_data[["popularity_rank"]]
 )
+
 
 # Add proximity to POI for each candidate stop
 def nearest_poi(lat, lon):
@@ -64,9 +65,38 @@ def nearest_poi(lat, lon):
     distances = [stop_point.distance(poi) for poi in poi_points]
     return min(distances) if distances else np.nan
 
+
 candidate_stops["nearest_poi_dist"] = candidate_stops.apply(
     lambda row: nearest_poi(row["Latitude"], row["Longitude"]), axis=1
 )
+
+# Combine all features for training
+features = candidate_stops[["nearest_poi_dist"]]
+labels = candidate_stops[["Latitude", "Longitude"]]
+
+# Split the data
+X_train, X_test, y_train, y_test = train_test_split(features, labels, test_size=0.2)
+
+# Save the training and testing data
+train_data = pd.concat([X_train, y_train], axis=1)
+test_data = pd.concat([X_test, y_test], axis=1)
+
+train_data.to_csv("train_data.csv", index=False)
+test_data.to_csv("test_data.csv", index=False)
+
+print("Training and testing data saved to 'train_data.csv' and 'test_data.csv'")
+
+# --------------------------
+# (Optional) Reload Data in Future
+# --------------------------
+# Uncomment below to reload the saved data
+# train_data = pd.read_csv("train_data.csv")
+# test_data = pd.read_csv("test_data.csv")
+# X_train = train_data.iloc[:, :-2]
+# y_train = train_data.iloc[:, -2:]
+# X_test = test_data.iloc[:, :-2]
+# y_test = test_data.iloc[:, -2:]
+
 
 # --------------------------
 # STEP 4: Train the ML Model
