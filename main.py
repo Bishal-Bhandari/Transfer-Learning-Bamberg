@@ -10,43 +10,35 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 import numpy as np
 from shapely.geometry import Point, LineString
-from shapely.ops import nearest_points
+from scipy.spatial import cKDTree
 
 
 # Load OSM Map Data
-city_name = "Bamberg, Germany"
-G = ox.graph_from_place(city_name, network_type="drive")
-nodes, edges = ox.graph_to_gdfs(G)
+def load_osm_data(city_name, network_type="drive"):
+    G = ox.graph_from_place(city_name, network_type=network_type)
+    _, edges = ox.graph_to_gdfs(G)
+    road_geometries = edges["geometry"]
+    candidate_stops = []
+    for geom in road_geometries:
+        if isinstance(geom, LineString):
+            candidate_stops.extend(list(geom.coords))
+    return pd.DataFrame(candidate_stops, columns=["Longitude", "Latitude"])
 
-# Extract Features from OSM
-road_geometries = edges["geometry"]
-
-candidate_stops = []
-for geom in road_geometries:
-    if isinstance(geom, LineString):
-        candidate_stops.extend(list(geom.coords))
-
-candidate_stops = pd.DataFrame(candidate_stops, columns=["Longitude", "Latitude"])
 
 # Fetch Weather Data
-# Load API
-with open('api_keys.json') as json_file:
-    api_keys = json.load(json_file)
-
-# Weather API key
-API_KEY = api_keys['Weather_API']['API_key']
-
-WEATHER_API_URL = "http://api.openweathermap.org/data/2.5/weather"
+def load_api_keys(file_path='api_keys.json'):
+    with open(file_path) as json_file:
+        return json.load(json_file)
 
 
-def fetch_weather(lat, lon):
+def fetch_weather(lat, lon, api_key, url="http://api.openweathermap.org/data/2.5/weather"):
     params = {
         "lat": lat,
         "lon": lon,
-        "appid": API_KEY,
-        "units": "metric"  # Use metric system for temperature, etc.
+        "appid": api_key,
+        "units": "metric"
     }
-    response = requests.get(WEATHER_API_URL, params=params)
+    response = requests.get(url, params=params)
     if response.status_code == 200:
         weather = response.json()
         return {
@@ -58,106 +50,94 @@ def fetch_weather(lat, lon):
         return {"temp": np.nan, "humidity": np.nan, "wind_speed": np.nan}
 
 
-# Add weather data to candidate stops
-weather_data = []
-for _, row in candidate_stops.iterrows():
-    weather = fetch_weather(row["Latitude"], row["Longitude"])
-    weather_data.append(weather)
+def add_weather_data(candidate_stops, api_key):
+    weather_data = [
+        fetch_weather(row["Latitude"], row["Longitude"], api_key)
+        for _, row in candidate_stops.iterrows()
+    ]
+    return pd.concat([candidate_stops, pd.DataFrame(weather_data)], axis=1)
 
-# Convert weather data to DataFrame
-weather_df = pd.DataFrame(weather_data)
 
-# Merge weather data with candidate stops
-candidate_stops = pd.concat([candidate_stops, weather_df], axis=1)
+# Normalize data
+def normalize_data(df, columns):
+    scaler = MinMaxScaler()
+    normalized = scaler.fit_transform(df[columns])
+    return pd.DataFrame(normalized, columns=[col + "_normalized" for col in columns], index=df.index)
 
-# Load and Prepare Additional Data (Population Density, POI)
+
+# Compute proximity to POI
+def compute_nearest_poi(candidate_stops, poi_data):
+    candidate_coords = candidate_stops[["Longitude", "Latitude"]].to_numpy()
+    poi_coords = poi_data[["Longitude", "Latitude"]].to_numpy()
+    poi_tree = cKDTree(poi_coords)
+    distances, _ = poi_tree.query(candidate_coords)
+    candidate_stops["nearest_poi_dist"] = distances
+    return candidate_stops
+
+
+# Prepare training and testing data
+def prepare_data(candidate_stops, features_columns, labels_columns, test_size=0.2):
+    features = candidate_stops[features_columns]
+    labels = candidate_stops[labels_columns]
+    X_train, X_test, y_train, y_test = train_test_split(features, labels, test_size=test_size)
+    return X_train, X_test, y_train, y_test
+
+
+# Build and train the model
+def build_and_train_model(X_train, y_train, input_shape):
+    model = models.Sequential([
+        layers.Dense(64, activation="relu", input_shape=(input_shape,)),
+        layers.Dropout(0.3),
+        layers.Dense(32, activation="relu"),
+        layers.Dense(2, activation="linear")
+    ])
+    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+    model.fit(X_train, y_train, validation_split=0.2, epochs=50, batch_size=16)
+    return model
+
+
+# Visualize results on map
+def visualize_results_on_map(candidate_stops, predicted_stops, output_file, city_center, zoom_start=13):
+    city_map = folium.Map(location=city_center, zoom_start=zoom_start)
+    for _, row in candidate_stops.iterrows():
+        folium.Marker(
+            location=[row["Latitude"], row["Longitude"]],
+            tooltip="Candidate Stop",
+            icon=folium.Icon(color="blue", icon="info-sign")
+        ).add_to(city_map)
+    for stop in predicted_stops:
+        folium.Marker(
+            location=[stop[0], stop[1]],
+            tooltip="Predicted Stop",
+            icon=folium.Icon(color="green", icon="info-sign")
+        ).add_to(city_map)
+    city_map.save(output_file)
+
+
+# Main process
+city_name = "Bamberg, Germany"
+candidate_stops = load_osm_data(city_name)
+api_keys = load_api_keys()
+candidate_stops = add_weather_data(candidate_stops, api_keys['Weather_API']['API_key'])
 population_density_data = pd.read_excel("Training Data/final_busStop_density.ods", engine="odf")
 poi_data = pd.read_excel("Training Data/osm_poi_rank_data.ods", engine="odf")
-
-# Normalize density and popularity scores
-scaler = MinMaxScaler()
-population_density_data["density_normalized"] = scaler.fit_transform(population_density_data[["Density"]])
-poi_data["popularity_normalized"] = scaler.fit_transform(poi_data[["popularity_rank"]])
-
-
-# Add proximity to POI for each candidate stop
-def nearest_poi(lat, lon):
-    stop_point = Point(lon, lat)
-    poi_points = poi_data.apply(
-        lambda row: Point(row["Longitude"], row["Latitude"]), axis=1
-    )
-    distances = [stop_point.distance(poi) for poi in poi_points]
-    return min(distances) if distances else np.nan
-
-
-candidate_stops["nearest_poi_dist"] = candidate_stops.apply(
-    lambda row: nearest_poi(row["Latitude"], row["Longitude"]), axis=1
-)
-
-# Normalize weather features
-candidate_stops[["temp_normalized", "humidity_normalized", "wind_speed_normalized"]] = scaler.fit_transform(
-    candidate_stops[["temp", "humidity", "wind_speed"]]
-)
-
-# Combine Features for Model Training
-features = candidate_stops[["nearest_poi_dist", "temp_normalized", "humidity_normalized", "wind_speed_normalized"]]
-labels = candidate_stops[["Latitude", "Longitude"]]
-
-# Split the data
-X_train, X_test, y_train, y_test = train_test_split(features, labels, test_size=0.2)
-
-# Save the training and testing data
-train_data = pd.concat([X_train, y_train], axis=1)
-test_data = pd.concat([X_test, y_test], axis=1)
-
-train_data.to_csv("Model Data/train_data.csv", index=False)
-test_data.to_csv("Model Data/test_data.csv", index=False)
-
-print("Training and testing data saved to 'train_data.csv' and 'test_data.csv'")
-
-# STEP 6: Define and Train ML Model
-model = models.Sequential([
-    layers.Dense(64, activation="relu", input_shape=(X_train.shape[1],)),
-    layers.Dropout(0.3),
-    layers.Dense(32, activation="relu"),
-    layers.Dense(2, activation="linear"),  # Predict Latitude and Longitude
-])
-
-model.compile(optimizer="adam", loss="mse", metrics=["mae"])
-
-# Train the model
-model.fit(X_train, y_train, validation_split=0.2, epochs=50, batch_size=16)
-
-# Predict New Bus Stops
-# Example of predicting new bus stops (adjust features as necessary)
+poi_data["popularity_normalized"] = normalize_data(poi_data, ["popularity_rank"])["popularity_rank_normalized"]
+candidate_stops = compute_nearest_poi(candidate_stops, poi_data)
+candidate_stops = pd.concat([candidate_stops, normalize_data(candidate_stops, ["temp", "humidity", "wind_speed"])],
+                            axis=1)
+features_columns = ["nearest_poi_dist", "temp_normalized", "humidity_normalized", "wind_speed_normalized"]
+labels_columns = ["Latitude", "Longitude"]
+X_train, X_test, y_train, y_test = prepare_data(candidate_stops, features_columns, labels_columns)
+X_train.to_csv("Model Data/train_data.csv", index=False)
+X_test.to_csv("Model Data/test_data.csv", index=False)
+model = build_and_train_model(X_train, y_train, len(features_columns))
 new_data = pd.DataFrame({
     "nearest_poi_dist": [0.1, 0.2],
     "temp_normalized": [0.5, 0.6],
     "humidity_normalized": [0.7, 0.8],
     "wind_speed_normalized": [0.3, 0.4]
 })
-
 predicted_stops = model.predict(new_data)
-
-# Visualize Results on Map
-city_map = folium.Map(location=[49.8930, 10.9028], zoom_start=13)  # Bamberg's center
-
-# Add existing candidate stops to the map
-for _, row in candidate_stops.iterrows():
-    folium.Marker(
-        location=[row["Latitude"], row["Longitude"]],
-        tooltip="Candidate Stop",
-        icon=folium.Icon(color="blue", icon="info-sign"),
-    ).add_to(city_map)
-
-# Add predicted bus stops
-for stop in predicted_stops:
-    folium.Marker(
-        location=[stop[0], stop[1]],
-        tooltip="Predicted Stop",
-        icon=folium.Icon(color="green", icon="info-sign"),
-    ).add_to(city_map)
-
-# Save the map
-city_map.save("predicted_bus_stops_with_weather_and_osm.html")
+visualize_results_on_map(candidate_stops, predicted_stops, "Template/predicted_bus_stops_with_weather_and_osm.html",
+                         city_center=[49.8930, 10.9028])
 print("Map saved as 'predicted_bus_stops_with_weather_and_osm.html'")
