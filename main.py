@@ -9,13 +9,10 @@ import numpy as np
 from shapely.geometry import Point
 from shapely.ops import nearest_points
 
-# --------------------------
-# STEP 1: Load the Data
-# --------------------------
 # Load ODS files (change paths to your actual file locations)
-bus_stop_data = pd.read_excel('filtered_busStop_LatLong.ods', engine='odf')
-population_density_data = pd.read_excel('BusStop_Density.ods', engine='odf')
-poi_data = pd.read_excel('POI_Data.ods', engine='odf')
+bus_stop_data = pd.read_excel('Data/filtered_busStop_LatLong.ods', engine='odf')
+population_density_data = pd.read_excel('Data/final_busStop_density.ods', engine='odf')
+poi_data = pd.read_excel('Data/osm_poi_rank_data.ods', engine='odf')
 
 # Merge population density with bus stop data
 data = pd.merge(bus_stop_data, population_density_data, on="name", how="left")
