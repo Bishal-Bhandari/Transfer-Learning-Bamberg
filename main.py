@@ -1,98 +1,126 @@
+import osmnx as ox
+import networkx as nx
 import pandas as pd
-import geopandas as gpd
 import folium
 import tensorflow as tf
 from tensorflow.keras import layers, models
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 import numpy as np
-from shapely.geometry import Point
+from shapely.geometry import Point, LineString
 from shapely.ops import nearest_points
 
-# Load ODS files (change paths to your actual file locations)
-bus_stop_data = pd.read_excel('Data/filtered_busStop_LatLong.ods', engine='odf')
-population_density_data = pd.read_excel('Data/final_busStop_density.ods', engine='odf')
-poi_data = pd.read_excel('Data/osm_poi_rank_data.ods', engine='odf')
+# --------------------------
+# STEP 1: Load OSM Map Data
+# --------------------------
+# Define the area of interest (change this to your city or region)
+city_name = "Bamberg, Germany"
 
-# Merge population density with bus stop data
-data = pd.merge(bus_stop_data, population_density_data, on="name", how="left")
+# Load the road network from OSM
+G = ox.graph_from_place(city_name, network_type="drive")
 
-# Convert POI lat-long to GeoDataFrame
-poi_gdf = gpd.GeoDataFrame(
-    poi_data, geometry=gpd.points_from_xy(poi_data.Longitude, poi_data.Latitude)
+# Convert the graph to a GeoDataFrame for easier analysis
+nodes, edges = ox.graph_to_gdfs(G)
+
+# --------------------------
+# STEP 2: Extract Features from OSM
+# --------------------------
+# Extract all road geometries
+road_geometries = edges["geometry"]
+
+# If bus route data is available in OSM, extract it (optional)
+# bus_routes = ox.features_from_tags(G, {"route": "bus"})
+
+# Generate sample points along the roads as potential bus stop candidates
+candidate_stops = []
+for geom in road_geometries:
+    if isinstance(geom, LineString):
+        candidate_stops.extend(list(geom.coords))
+
+candidate_stops = pd.DataFrame(candidate_stops, columns=["Longitude", "Latitude"])
+
+# --------------------------
+# STEP 3: Prepare Input Data
+# --------------------------
+# Assume additional datasets like population density and POI exist
+population_density_data = pd.read_excel("BusStop_Density.ods", engine="odf")
+poi_data = pd.read_excel("POI_Data.ods", engine="odf")
+
+# Normalize density and popularity scores
+scaler = MinMaxScaler()
+population_density_data["density_normalized"] = scaler.fit_transform(
+    population_density_data[["density"]]
+)
+poi_data["popularity_normalized"] = scaler.fit_transform(
+    poi_data[["popularity_score"]]
 )
 
-# Normalize POI popularity score and density
-scaler = MinMaxScaler()
-data['density_normalized'] = scaler.fit_transform(data[['density']])
-poi_data['popularity_normalized'] = scaler.fit_transform(poi_data[['popularity_score']])
-
-
-# --------------------------
-# STEP 2: Feature Engineering
-# --------------------------
-# Example: Calculate distance from each bus stop to nearest POI
-
-
+# Add proximity to POI for each candidate stop
 def nearest_poi(lat, lon):
     stop_point = Point(lon, lat)
-    nearest = poi_gdf.geometry.apply(lambda x: stop_point.distance(x))
-    return nearest.min()
+    poi_points = poi_data.apply(
+        lambda row: Point(row["Longitude"], row["Latitude"]), axis=1
+    )
+    distances = [stop_point.distance(poi) for poi in poi_points]
+    return min(distances) if distances else np.nan
 
-
-data['nearest_poi_dist'] = data.apply(lambda row: nearest_poi(row.Latitude, row.Longitude), axis=1)
-
-# Combine features into a dataset
-features = data[['density_normalized', 'nearest_poi_dist']]
-labels = data[['Latitude', 'Longitude']]
-
-# Split the dataset
-X_train, X_test, y_train, y_test = train_test_split(features, labels, test_size=0.2, random_state=42)
+candidate_stops["nearest_poi_dist"] = candidate_stops.apply(
+    lambda row: nearest_poi(row["Latitude"], row["Longitude"]), axis=1
+)
 
 # --------------------------
-# STEP 3: Build and Train the Model
+# STEP 4: Train the ML Model
 # --------------------------
-# Define a simple neural network
+# Combine all features for training
+features = candidate_stops[["nearest_poi_dist"]]
+labels = candidate_stops[["Latitude", "Longitude"]]
+
+# Split the data
+X_train, X_test, y_train, y_test = train_test_split(features, labels, test_size=0.2)
+
+# Define the neural network
 model = models.Sequential([
-    layers.Dense(64, activation='relu', input_shape=(X_train.shape[1],)),
+    layers.Dense(64, activation="relu", input_shape=(X_train.shape[1],)),
     layers.Dropout(0.3),
-    layers.Dense(32, activation='relu'),
-    layers.Dense(2, activation='linear')  # Output latitude and longitude
+    layers.Dense(32, activation="relu"),
+    layers.Dense(2, activation="linear"),  # Predict Latitude and Longitude
 ])
 
 # Compile the model
-model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+model.compile(optimizer="adam", loss="mse", metrics=["mae"])
 
 # Train the model
 model.fit(X_train, y_train, validation_split=0.2, epochs=50, batch_size=16)
 
 # --------------------------
-# STEP 4: Predict New Bus Stops
+# STEP 5: Predict New Bus Stops
 # --------------------------
-# Example input: high-density areas with no bus stops
-new_data = pd.DataFrame({
-    'density_normalized': [0.9, 0.8],
-    'nearest_poi_dist': [0.1, 0.2]
-})
-
+# Predict stops for high-density areas
+new_data = pd.DataFrame({"nearest_poi_dist": [0.1, 0.2]})  # Adjust input features
 predicted_stops = model.predict(new_data)
 
 # --------------------------
-# STEP 5: Visualize Results
+# STEP 6: Visualize on Map
 # --------------------------
 # Create a map centered on the city
-map_center = [data['Latitude'].mean(), data['Longitude'].mean()]
-city_map = folium.Map(location=map_center, zoom_start=13)
+city_map = folium.Map(location=[49.8930, 10.9028], zoom_start=13)  # Bamberg's center
 
-# Plot existing bus stops
-for _, row in data.iterrows():
-    folium.Marker(location=[row['Latitude'], row['Longitude']], tooltip="Existing Bus Stop").add_to(city_map)
+# Add existing candidate stops to the map
+for _, row in candidate_stops.iterrows():
+    folium.Marker(
+        location=[row["Latitude"], row["Longitude"]],
+        tooltip="Candidate Stop",
+        icon=folium.Icon(color="blue", icon="info-sign"),
+    ).add_to(city_map)
 
-# Plot predicted bus stops
+# Add predicted bus stops
 for stop in predicted_stops:
-    folium.Marker(location=[stop[0], stop[1]], tooltip="New Bus Stop", icon=folium.Icon(color='green')).add_to(city_map)
+    folium.Marker(
+        location=[stop[0], stop[1]],
+        tooltip="Predicted Stop",
+        icon=folium.Icon(color="green", icon="info-sign"),
+    ).add_to(city_map)
 
 # Save the map
-city_map.save("predicted_bus_stops.html")
-
-print("Map saved as 'predicted_bus_stops.html'")
+city_map.save("predicted_bus_stops_with_osm.html")
+print("Map saved as 'predicted_bus_stops_with_osm.html'")
