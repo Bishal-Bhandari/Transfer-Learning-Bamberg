@@ -1,97 +1,72 @@
 import pandas as pd
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.applications import ResNet50
-from tensorflow.keras.applications.resnet50 import preprocess_input
 from sklearn.cluster import KMeans
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report
 import matplotlib.pyplot as plt
 
-
 # Load data
-def load_data(bus_stop_file, population_density_file, poi_file):
-    bus_stops = pd.read_csv(bus_stop_file)  # Columns: Latitude, Longitude, StopName
+def load_data(population_density_file, poi_file):
     population_density = pd.read_csv(population_density_file)  # Columns: Latitude, Longitude, Density
-    pois = pd.read_csv(poi_file)  # Columns: Latitude, Longitude, POIType
+    pois = pd.read_csv(poi_file)  # Columns: Latitude, Longitude, POIType, Importance (optional)
 
-    return bus_stops, population_density, pois
-
+    return population_density, pois
 
 # Example file paths
-bus_stop_file = "bus_stops.csv"
 population_density_file = "population_density.csv"
 poi_file = "pois.csv"
 
-bus_stops, population_density, pois = load_data(bus_stop_file, population_density_file, poi_file)
+population_density, pois = load_data(population_density_file, poi_file)
 
-# Combine data into a single DataFrame
-data = pd.concat([
-    bus_stops[['Latitude', 'Longitude']],
-    population_density[['Latitude', 'Longitude']],
-    pois[['Latitude', 'Longitude']]
-], axis=0, ignore_index=True)
+# Aggregate POI data (if Importance is available, weight POIs by it)
+def aggregate_poi_data(pois):
+    if 'Importance' in pois.columns:
+        pois['WeightedPOI'] = pois['Importance']
+    else:
+        pois['WeightedPOI'] = 1
 
-data['Type'] = [
-    'BusStop' if i < len(bus_stops) else \
-        'PopulationDensity' if i < len(bus_stops) + len(population_density) else \
-            'POI' for i in range(len(data))
-]
+    poi_density = pois.groupby(['Latitude', 'Longitude']).sum().reset_index()
+    return poi_density
 
+poi_density = aggregate_poi_data(pois)
+
+# Merge population density and POI data
+combined_data = pd.merge(
+    population_density, poi_density,
+    on=['Latitude', 'Longitude'], how='outer'
+).fillna(0)  # Fill missing values with 0
+
+# Calculate a score for potential bus stop locations
+combined_data['Score'] = combined_data['Density'] + combined_data['WeightedPOI']
 
 # Preprocessing
 def preprocess_data(data):
-    features = data[['Latitude', 'Longitude']].values
+    features = data[['Latitude', 'Longitude', 'Score']].values
     scaler = StandardScaler()
-    features = scaler.fit_transform(features)
+    features[:, 2] = scaler.fit_transform(features[:, 2].reshape(-1, 1)).flatten()
     return features
 
+features = preprocess_data(combined_data)
 
-features = preprocess_data(data)
+# Clustering with KMeans to identify optimal bus stop locations
+kmeans = KMeans(n_clusters=10, random_state=42)  # Adjust the number of clusters as needed
+combined_data['Cluster'] = kmeans.fit_predict(features)
 
-# Transfer Learning using ResNet50
-base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+# Determine potential bus stop locations (centroids of clusters)
+bus_stop_locations = kmeans.cluster_centers_[:, :2]
 
-
-# Generate synthetic images from lat/lon as dummy data
-# In practice, this would use a meaningful transformation of lat/lon into image-like data.
-def generate_synthetic_images(features, num_samples):
-    images = np.zeros((num_samples, 224, 224, 3))
-    for i in range(num_samples):
-        lat, lon = features[i]
-        images[i, :, :, 0] = lat  # Red channel
-        images[i, :, :, 1] = lon  # Green channel
-        images[i, :, :, 2] = lat + lon  # Blue channel
-    return images
-
-
-images = generate_synthetic_images(features, len(features))
-images = preprocess_input(images)
-
-# Extract features
-feature_maps = base_model.predict(images)
-flattened_features = feature_maps.reshape(len(features), -1)
-
-# Clustering with KMeans
-kmeans = KMeans(n_clusters=3, random_state=42)
-clusters = kmeans.fit_predict(flattened_features)
-data['Cluster'] = clusters
-
-# Classification example
-X_train, X_test, y_train, y_test = train_test_split(flattened_features, clusters, test_size=0.2, random_state=42)
-classifier = LogisticRegression()
-classifier.fit(X_train, y_train)
-y_pred = classifier.predict(X_test)
-
-# Evaluation
-print(classification_report(y_test, y_pred))
-
-# Visualization
-plt.scatter(data['Latitude'], data['Longitude'], c=data['Cluster'], cmap='viridis', s=10)
+# Visualize the results
+plt.figure(figsize=(10, 6))
+plt.scatter(combined_data['Latitude'], combined_data['Longitude'], c=combined_data['Cluster'], cmap='viridis', s=10, label='Data Points')
+plt.scatter(bus_stop_locations[:, 0], bus_stop_locations[:, 1], color='red', label='Proposed Bus Stops', marker='x')
 plt.xlabel('Latitude')
 plt.ylabel('Longitude')
-plt.title('Clustered Data Points')
+plt.title('Proposed Bus Stop Locations Based on Population Density and POI')
+plt.legend()
 plt.colorbar(label='Cluster')
 plt.show()
+
+# Save proposed bus stop locations
+proposed_bus_stops = pd.DataFrame(bus_stop_locations, columns=['Latitude', 'Longitude'])
+proposed_bus_stops.to_csv("proposed_bus_stops.csv", index=False)
+
+print("Proposed bus stop locations saved to 'proposed_bus_stops.csv'")
