@@ -4,6 +4,7 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 
+
 # Load data
 def load_data(population_density_file, poi_file):
     population_density = pd.read_csv(population_density_file)  # Columns: Latitude, Longitude, Density
@@ -11,11 +12,13 @@ def load_data(population_density_file, poi_file):
 
     return population_density, pois
 
+
 # Example file paths
 population_density_file = "population_density.csv"
 poi_file = "pois.csv"
 
 population_density, pois = load_data(population_density_file, poi_file)
+
 
 # Aggregate POI data (if Importance is available, weight POIs by it)
 def aggregate_poi_data(pois):
@@ -26,6 +29,7 @@ def aggregate_poi_data(pois):
 
     poi_density = pois.groupby(['Latitude', 'Longitude']).sum().reset_index()
     return poi_density
+
 
 poi_density = aggregate_poi_data(pois)
 
@@ -38,12 +42,14 @@ combined_data = pd.merge(
 # Calculate a score for potential bus stop locations
 combined_data['Score'] = combined_data['Density'] + combined_data['WeightedPOI']
 
+
 # Preprocessing
 def preprocess_data(data):
     features = data[['Latitude', 'Longitude', 'Score']].values
     scaler = StandardScaler()
     features[:, 2] = scaler.fit_transform(features[:, 2].reshape(-1, 1)).flatten()
     return features
+
 
 features = preprocess_data(combined_data)
 
@@ -56,7 +62,8 @@ bus_stop_locations = kmeans.cluster_centers_[:, :2]
 
 # Visualize the results
 plt.figure(figsize=(10, 6))
-plt.scatter(combined_data['Latitude'], combined_data['Longitude'], c=combined_data['Cluster'], cmap='viridis', s=10, label='Data Points')
+plt.scatter(combined_data['Latitude'], combined_data['Longitude'], c=combined_data['Cluster'], cmap='viridis', s=10,
+            label='Data Points')
 plt.scatter(bus_stop_locations[:, 0], bus_stop_locations[:, 1], color='red', label='Proposed Bus Stops', marker='x')
 plt.xlabel('Latitude')
 plt.ylabel('Longitude')
