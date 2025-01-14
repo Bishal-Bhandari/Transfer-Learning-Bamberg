@@ -1,148 +1,123 @@
-import json
-import os
-import osmnx as ox
-import networkx as nx
-import pandas as pd
 import folium
-import requests
-import tensorflow as tf
-from tensorflow.keras import layers, models
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
+import osmnx as ox
+import pandas as pd
 import numpy as np
-from shapely.geometry import LineString
-from scipy.spatial import cKDTree
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import torch
+from torch import nn
+from torch.optim import Adam
+from geopy.geocoders import Nominatim
 
-# Set global paths
-BASE_DIR = "Training Data/"
-SAVE_DIR = "Model Data/"
-CANDIDATE_STOPS_FILE = os.path.join(BASE_DIR, "filtered_busStop_LatLong.ods")
-POP_DENSITY_FILE = os.path.join(BASE_DIR, "final_busStop_density.ods")
-POI_RANK_FILE = os.path.join(BASE_DIR, "osm_poi_rank_data.ods")
-API_KEYS_FILE = "api_keys.json"  # Update if needed
-
-
-# Load OSM Map Data
-def load_osm_data(city_name, network_type="drive"):
-    G = ox.graph_from_place(city_name, network_type=network_type)
-    _, edges = ox.graph_to_gdfs(G)
-    road_geometries = edges["geometry"]
-    candidate_stops = []
-    for geom in road_geometries:
-        if isinstance(geom, LineString):
-            candidate_stops.extend(list(geom.coords))
-    return pd.DataFrame(candidate_stops, columns=["Longitude", "Latitude"])
+# Load your ODS data
+data = pd.read_excel("Training Data/final_busStop_density.ods")
 
 
-# Fetch Weather Data
-def load_api_keys(file_path):
-    with open(file_path) as json_file:
-        return json.load(json_file)
-
-
-def fetch_weather(lat, lon, api_key, url="http://api.openweathermap.org/data/2.5/weather"):
-    params = {
-        "lat": lat,
-        "lon": lon,
-        "appid": api_key,
-        "units": "metric"
-    }
-    response = requests.get(url, params=params)
-    if response.status_code == 200:
-        weather = response.json()
-        rain = weather.get("rain", {}).get("1h", np.nan)
-        return {
-            "temp": weather["main"]["temp"],
-            "humidity": weather["main"]["humidity"],
-            "wind_speed": weather["wind"]["speed"],
-            "rain": rain
-        }
+# Function to get latitude and longitude for a city
+def get_city_latlon(city_name):
+    geolocator = Nominatim(user_agent="bus_stop_prediction")
+    location = geolocator.geocode(city_name)
+    if location:
+        return location.latitude, location.longitude
     else:
-        return {"temp": np.nan, "humidity": np.nan, "wind_speed": np.nan, "rain": np.nan}
+        raise ValueError("City not found.")
 
 
-def add_weather_data(candidate_stops, api_key):
-    weather_data = [
-        fetch_weather(row["Latitude"], row["Longitude"], api_key)
-        for _, row in candidate_stops.iterrows()
-    ]
-    weather_df = pd.DataFrame(weather_data)
-    return pd.concat([candidate_stops, weather_df], axis=1)
+# Get city input
+city_name = "Bamberg"
+# city_name = input("Enter the city name for bus stop generation: ")
+city_lat, city_lon = get_city_latlon(city_name)
+
+# In the ODS
+latitude = data['Latitude']
+longitude = data['Longitude']
+density = data['Density']
 
 
-# Normalize Data
-def normalize_data(df, columns):
-    scaler = MinMaxScaler()
-    normalized = scaler.fit_transform(df[columns])
-    return pd.DataFrame(normalized, columns=[col + "_normalized" for col in columns], index=df.index)
+# fetch nearby POI
+def get_nearby_roads(lat, lon, distance=500):
+    # Get nearby streets
+    G = ox.graph_from_point((lat, lon), dist=distance, network_type='all')
+    return len(list(G.edges))  # Number of road segments nearby
 
 
-# Compute Proximity to POI
-def compute_nearest_poi(candidate_stops, poi_data):
-    candidate_coords = candidate_stops[["Longitude", "Latitude"]].to_numpy()
-    poi_coords = poi_data[["Longitude", "Latitude"]].to_numpy()
-    poi_tree = cKDTree(poi_coords)
-    distances, _ = poi_tree.query(candidate_coords)
-    candidate_stops["nearest_poi_dist"] = distances
-    return candidate_stops
+data['Nearby_Roads'] = [get_nearby_roads(lat, lon) for lat, lon in zip(latitude, longitude)]
+
+# Prepare the feature matrix (X) and labels (y)
+X = np.column_stack([latitude, longitude, density, data['Nearby_Roads']])
+y = np.array([1 if density >= 3 else 0 for density in data['Density']])
+
+# Scale the features
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Train-test split
+X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
 
 
-# Assign Population Density to Stops
-def assign_population_density(candidate_stops, population_density_data):
-    density_coords = population_density_data[["Longitude", "Latitude"]].to_numpy()
-    density_values = population_density_data["Density_Rank"].to_numpy()
-    density_tree = cKDTree(density_coords)
-    distances, indices = density_tree.query(candidate_stops[["Longitude", "Latitude"]].to_numpy())
-    candidate_stops["population_density"] = density_values[indices]
-    return candidate_stops
+# Define the neural network
+class BusStopPredictionModel(nn.Module):
+    def __init__(self):
+        super(BusStopPredictionModel, self).__init__()
+        self.fc1 = nn.Linear(X_train.shape[1], 64)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = self.sigmoid(self.fc3(x))
+        return x
 
 
-# Prepare Data
-def prepare_data(candidate_stops, features_columns, labels_columns, test_size=0.2):
-    features = candidate_stops[features_columns]
-    labels = candidate_stops[labels_columns]
-    return train_test_split(features, labels, test_size=test_size)
+# Instantiate and train the model
+model = BusStopPredictionModel()
+optimizer = Adam(model.parameters(), lr=0.001)
+criterion = nn.BCELoss()
 
+# Convert data to tensors
+X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+y_train_tensor = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
 
-# Build and Train Model
-def build_and_train_model(X_train, y_train, input_shape):
-    model = models.Sequential([
-        layers.Dense(64, activation="relu", input_shape=(input_shape,)),
-        layers.Dropout(0.3),
-        layers.Dense(32, activation="relu"),
-        layers.Dense(2, activation="linear")
-    ])
-    model.compile(optimizer="adam", loss="mse", metrics=["mae"])
-    model.fit(X_train, y_train, validation_split=0.2, epochs=25, batch_size=16)
-    return model
+# Training loop
+for epoch in range(100):
+    model.train()
+    optimizer.zero_grad()
+    output = model(X_train_tensor)
+    loss = criterion(output, y_train_tensor)
+    loss.backward()
+    optimizer.step()
 
+    if (epoch + 1) % 10 == 0:
+        print(f'Epoch {epoch + 1}/{100}, Loss: {loss.item()}')
 
-# Main Execution
-def main():
-    # Load data
-    api_keys = load_api_keys(API_KEYS_FILE)
-    population_density_data = pd.read_excel(POP_DENSITY_FILE, engine="odf")
-    poi_data = pd.read_excel(POI_RANK_FILE, engine="odf")
+# Model evaluation
+model.eval()
+X_test_tensor = torch.tensor(X_test, dtype=torch.float32)
+y_test_tensor = torch.tensor(y_test, dtype=torch.float32).view(-1, 1)
 
-    # Preprocess candidate stops
-    candidate_stops = pd.read_excel(CANDIDATE_STOPS_FILE, engine="odf")
-    candidate_stops = add_weather_data(candidate_stops, api_keys['Weather_API']['API_key'])
-    candidate_stops = assign_population_density(candidate_stops, population_density_data)
-    candidate_stops = compute_nearest_poi(candidate_stops, poi_data)
+with torch.no_grad():
+    output = model(X_test_tensor)
+    predictions = output.round()  # Predict 0 or 1 based on probability
+    accuracy = (predictions == y_test_tensor).float().mean()
+    print(f'Accuracy: {accuracy.item() * 100}%')
 
-    # Normalize and prepare data
-    features_columns = ["nearest_poi_dist", "temp", "humidity", "wind_speed", "population_density", "rain"]
-    labels_columns = ["Latitude", "Longitude"]
-    X_train, X_test, y_train, y_test = prepare_data(candidate_stops, features_columns, labels_columns)
+# Now predict bus stops for all locations
+predictions = model(torch.tensor(X_scaled, dtype=torch.float32))
+predicted_bus_stops = predictions.detach().numpy().flatten()
 
-    # Train model
-    model = build_and_train_model(X_train, y_train, len(features_columns))
+# Filter locations where the model predicts a bus stop (1)
+bus_stop_lat_lon = data[predicted_bus_stops >= 0.5][['Latitude', 'Longitude']]
 
-    # Save and predict
-    output_dir = os.path.join(SAVE_DIR, "output")
-    os.makedirs(output_dir, exist_ok=True)
-    candidate_stops.to_excel(os.path.join(output_dir, "processed_candidate_stops.ods"), engine="odf")
+# Create a Folium map centered around the city location
+city_map = folium.Map(location=[city_lat, city_lon], zoom_start=12)
 
+# Add markers for predicted bus stop locations
+for _, row in bus_stop_lat_lon.iterrows():
+    folium.Marker([row['Latitude'], row['Longitude']], popup="Predicted Bus Stop").add_to(city_map)
 
-if __name__ == "__main__":
-    main()
+# Save the map to an HTML file
+city_map.save(f'Template/{city_name}_bus_stops.html')
+
+print(f"Map has been saved as {city_name}_bus_stops.html")
