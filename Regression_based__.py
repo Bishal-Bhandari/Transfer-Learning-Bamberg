@@ -76,7 +76,7 @@ features_df = pd.DataFrame(features_list)
 
 # Split data into training and testing sets
 X = features_df[['density', 'distance_to_road']]  # Features
-y = data['bus_stop']  # Target variable (0: no bus stop, 1: bus stop)
+y = data['name']  # Target variable (0: no bus stop, 1: bus stop)
 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
 # Create and train the model
