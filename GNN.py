@@ -1,135 +1,128 @@
-import torch
-import torch.nn as nn
 import pandas as pd
-import numpy as np
-import networkx as nx
 import osmnx as ox
-from sklearn.preprocessing import StandardScaler
+import folium
+import torch
+from sklearn.preprocessing import MinMaxScaler
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
-from geopy.distance import geodesic
-import folium
 
-# Load data
-data = pd.read_excel("Training Data/final_busStop_density.ods", engine='odf')
 
-latitude = data['Latitude']
-longitude = data['Longitude']
-density = data['Density']
+# Step 1: Load ODS File and Normalize Data
+def load_data(file_path):
+    df = pd.read_excel(file_path, engine='odf')
+    scaler = MinMaxScaler()
+    df['Normalized_Density'] = scaler.fit_transform(df[['Population Density']])
+    return df
 
-# Nearby roads feature
-def get_nearby_roads(lat, lon, distance=500):
-    G = ox.graph_from_point((lat, lon), dist=distance, network_type='all')
-    return len(list(G.edges))  # Number of road segments
 
-# Add nearby roads feature to data
-data['Nearby_Roads'] = [get_nearby_roads(lat, lon) for lat, lon in zip(latitude, longitude)]
+# Step 2: Load OSM Data
+def get_osm_data():
+    graph = ox.graph_from_place("Bamberg, Germany", network_type='drive')
+    nodes, edges = ox.graph_to_gdfs(graph)
+    return graph, nodes, edges
 
-# Prepare features and labels
-X = np.column_stack([latitude, longitude, density, data['Nearby_Roads']])
-y = np.array([1 if density >= 3 else 0 for density in data['Density']])  # 1 for likely bus stop, 0 otherwise
 
-# Scale features
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
+# Step 3: Prepare Data for GNN
+def prepare_graph_data(df, graph, nodes):
+    # Map lat/long to nearest OSM nodes
+    df['Node_ID'] = df.apply(lambda row: ox.distance.nearest_nodes(graph, row['Longitude'], row['Latitude']), axis=1)
 
-# Create a graph
-G = nx.Graph()
+    # Create node features (normalized density mapped to graph nodes)
+    node_features = pd.DataFrame(index=nodes.index)
+    node_features['Density'] = 0
+    node_features.loc[df['Node_ID'], 'Density'] = df['Normalized_Density'].values
 
-# Add nodes with features
-for i, row in data.iterrows():
-    G.add_node(i, lat=row['Latitude'], lon=row['Longitude'], density=row['Density'], nearby_roads=row['Nearby_Roads'])
+    # Create PyTorch Geometric data object
+    edge_index = torch.tensor(list(graph.edges), dtype=torch.long).t().contiguous()
+    x = torch.tensor(node_features['Density'].values, dtype=torch.float).view(-1, 1)
+    data = Data(x=x, edge_index=edge_index)
+    return data, df
 
-# Define edges with proper distance calculation
-threshold_distance = 1000  # meters
-for i, node1 in data.iterrows():
-    for j, node2 in data.iterrows():
-        if i != j:
-            lat1, lon1 = node1['Latitude'], node1['Longitude']
-            lat2, lon2 = node2['Latitude'], node2['Longitude']
-            dist = geodesic((lat1, lon1), (lat2, lon2)).meters
-            if dist <= threshold_distance:
-                G.add_edge(i, j)
 
-# Data for PyTorch Geometric
-node_features = torch.tensor(X_scaled, dtype=torch.float)
-edge_index = torch.tensor(list(G.edges), dtype=torch.long).t().contiguous()  # Edge index format
-
-# Labels for nodes
-labels = torch.tensor(y, dtype=torch.float)
-
-# Create a data object for PyTorch Geometric
-data_gnn = Data(x=node_features, edge_index=edge_index, y=labels)
-
-# Graph Convolutional Network Model
-class GNNModel(nn.Module):
+# Step 4: Define GNN Model
+class GCN(torch.nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
-        super(GNNModel, self).__init__()
+        super(GCN, self).__init__()
         self.conv1 = GCNConv(input_dim, hidden_dim)
         self.conv2 = GCNConv(hidden_dim, output_dim)
-        self.dropout = nn.Dropout(p=0.6)  # Add dropout for regularization
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
         x = self.conv1(x, edge_index)
         x = torch.relu(x)
-        x = self.dropout(x)  # Apply dropout
         x = self.conv2(x, edge_index)
-        return x
+        return torch.sigmoid(x)
 
-# Initialize the model
-model = GNNModel(input_dim=X_scaled.shape[1], hidden_dim=64, output_dim=1)
 
-# Loss and optimizer
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-criterion = nn.BCEWithLogitsLoss()
+# Step 5: Train and Predict
 
-# Training loop
-for epoch in range(100):
+def train_gnn(data, epochs=100, lr=0.01):
+    model = GCN(input_dim=1, hidden_dim=16, output_dim=1)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = torch.nn.BCELoss()
+
     model.train()
-    optimizer.zero_grad()
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        out = model(data)
+        loss = loss_fn(out, data.x)
+        loss.backward()
+        optimizer.step()
+        print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item():.4f}")
+    return model
 
-    # Forward pass
-    output = model(data_gnn)
 
-    # Loss
-    loss = criterion(output.view(-1), data_gnn.y)
+def predict_gnn(model, data, df):
+    model.eval()
+    with torch.no_grad():
+        predictions = model(data).squeeze().numpy()
+        df['Probability'] = predictions[df['Node_ID']]
+    return df
 
-    # Backward pass and optimization
-    loss.backward()
-    optimizer.step()
 
-    if (epoch + 1) % 10 == 0:
-        print(f'Epoch {epoch + 1}/100, Loss: {loss.item()}')
+# Step 6: Visualize Results
+def visualize_results(df, output_html):
+    map_bamberg = folium.Map(location=[49.8988, 10.9028], zoom_start=13)
 
-# Evaluate the model
-model.eval()
-with torch.no_grad():
-    output = model(data_gnn)
-    predictions = torch.sigmoid(output).round()  # Convert to 0 or 1
-    accuracy = (predictions == data_gnn.y).float().mean()
-    print(f'Accuracy: {accuracy.item() * 100:.2f}%')
-
-# Post-process predictions
-predictions = torch.sigmoid(output).numpy().flatten()
-data['Predicted_Bus_Stop'] = predictions
-
-# Save results to ODS
-data.to_excel("predicted_bus_stops.ods", engine='odf')
-
-# Visualize on Folium map
-city_lat, city_lon = 49.89, 10.89  # Bamberg center coordinates
-city_map = folium.Map(location=[city_lat, city_lon], zoom_start=12)
-
-# Add markers for predicted bus stops
-for i, row in data.iterrows():
-    if row['Predicted_Bus_Stop'] >= 0.5:
+    for _, row in df.iterrows():
         folium.Marker(
-            [row['Latitude'], row['Longitude']],
-            popup=f"Density: {row['Density']}, Nearby Roads: {row['Nearby_Roads']}, Probability: {row['Predicted_Bus_Stop']:.2f}",
-            icon=folium.Icon(color="blue", icon="info-sign")
-        ).add_to(city_map)
+            location=[row['Latitude'], row['Longitude']],
+            popup=f"Location: {row['Location Name']}\nProbability: {row['Probability']:.2f}",
+            icon=folium.Icon(color='blue' if row['Probability'] > 0.5 else 'red')
+        ).add_to(map_bamberg)
 
-# Save map as an HTML file
-city_map.save('Template/predicted_bus_stops_map.html')
-print("Map with predicted bus stops saved as.")
+    map_bamberg.save(output_html)
+
+
+# Step 7: Main Function
+def main():
+    # File paths
+    input_file = "your_file.ods"
+    output_file = "predicted_bus_stops.ods"
+    output_html = "bus_stop_predictions.html"
+
+    # Load and preprocess data
+    df = load_data(input_file)
+
+    # Load OSM data
+    graph, nodes, _ = get_osm_data()
+
+    # Prepare graph data
+    data, df = prepare_graph_data(df, graph, nodes)
+
+    # Train GNN model
+    model = train_gnn(data)
+
+    # Predict probabilities
+    df = predict_gnn(model, data, df)
+
+    # Save results
+    df.to_excel(output_file, engine='odf')
+
+    # Visualize results
+    visualize_results(df, output_html)
+    print(f"Results saved to {output_file} and visualized in {output_html}")
+
+
+if __name__ == "__main__":
+    main()
