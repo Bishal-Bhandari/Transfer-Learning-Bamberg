@@ -11,7 +11,7 @@ from torch_geometric.nn import GCNConv
 def load_data(file_path):
     df = pd.read_excel(file_path, engine='odf')
     scaler = MinMaxScaler()
-    df['Normalized_Density'] = scaler.fit_transform(df[['Population Density']])
+    df['Normalized_Density'] = scaler.fit_transform(df[['Density']])
     return df
 
 
@@ -97,9 +97,9 @@ def visualize_results(df, output_html):
 # Step 7: Main Function
 def main():
     # File paths
-    input_file = "your_file.ods"
-    output_file = "predicted_bus_stops.ods"
-    output_html = "bus_stop_predictions.html"
+    input_file = "Training Data/final_busStop_density.ods"
+    output_file = "Model Data/GNN-predicted_bus_stops.ods"
+    output_html = "Template/GNN-bus_stop_predictions.html"
 
     # Load and preprocess data
     df = load_data(input_file)
