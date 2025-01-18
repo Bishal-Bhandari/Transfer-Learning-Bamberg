@@ -114,34 +114,6 @@ def predict_gnn(model, data, df):
     return df
 
 
-# Step 6: Calculate Performance Metrics
-# Step 6: Calculate Performance Metrics
-def calculate_performance_metrics(actuals, predictions):
-    # Remove NaN values by aligning both actuals and predictions
-    valid_indices = ~np.isnan(actuals) & ~np.isnan(predictions)  # Find indices where both are not NaN
-    actuals = actuals[valid_indices]
-    predictions = predictions[valid_indices]
-
-    # If after removing NaNs, no valid data is left, return None or some default value
-    if len(actuals) == 0 or len(predictions) == 0:
-        raise ValueError("No valid data left for performance calculation after removing NaNs.")
-
-    # Calculate MAE, MSE, RMSE, and R²
-    mae = mean_absolute_error(actuals, predictions)
-    mse = mean_squared_error(actuals, predictions)
-    rmse = np.sqrt(mse)
-    r2 = r2_score(actuals, predictions)
-
-    # Return all metrics as a dictionary
-    return {
-        "MAE": mae,
-        "MSE": mse,
-        "RMSE": rmse,
-        "R²": r2
-    }
-
-
-
 # Step 7: Visualize Results
 def visualize_results(df, output_html):
     map_bamberg = folium.Map(location=[49.8988, 10.9028], zoom_start=13)
@@ -178,16 +150,6 @@ def main():
 
     # Predict probabilities
     df = predict_gnn(model, data, df)
-
-    # Calculate performance metrics
-    actuals = df['Normalized_Density'].values
-    predictions = df['Probability'].values
-    metrics = calculate_performance_metrics(actuals, predictions)
-
-    # Print performance metrics
-    print("Performance Metrics:")
-    for metric, value in metrics.items():
-        print(f"{metric}: {value}")
 
     # Save results
     df.to_excel(output_file, engine='odf')
