@@ -37,7 +37,7 @@ def prepare_graph_data(df, graph, nodes):
     node_features['Density'] = 0
 
     # Assign normalized density to corresponding node IDs
-    node_features.loc[df['Node_ID'], 'Density'] = df['Normalized_Density'].values
+    node_features.loc[df['Node_ID'], 'Density'] = df['Normalized_Density'].values.astype(float)
 
     # Filter the graph to include only valid node indices
     valid_indices = list(node_features.index)  # Convert to list
@@ -63,11 +63,6 @@ def prepare_graph_data(df, graph, nodes):
     # Return the PyTorch Geometric data object
     data = Data(x=x, edge_index=edge_index)
     return data, df
-
-
-
-
-
 
 
 # Step 4: Define GNN Model
@@ -108,11 +103,13 @@ def predict_gnn(model, data, df):
     with torch.no_grad():
         predictions = model(data).squeeze().numpy()
 
-        # Fix: Align predictions with Node_ID using `df['Node_ID']`
-        node_predictions = pd.Series(predictions, index=df['Node_ID']).reindex(df['Node_ID']).values
+        # Create a Series with the predictions and align it with df['Node_ID']
+        node_predictions = pd.Series(predictions, index=range(len(predictions)))  # Use an integer range as the index
+        node_predictions = node_predictions.reindex(df['Node_ID']).values  # Align predictions with df['Node_ID']
+
+        # Set the predictions as the 'Probability' column in df
         df['Probability'] = node_predictions
     return df
-
 
 
 # Step 6: Visualize Results
@@ -120,9 +117,10 @@ def visualize_results(df, output_html):
     map_bamberg = folium.Map(location=[49.8988, 10.9028], zoom_start=13)
 
     for _, row in df.iterrows():
+        location_name = row.get('Location Name', 'Unknown Location')  # Fallback if 'Location Name' doesn't exist
         folium.Marker(
             location=[row['Latitude'], row['Longitude']],
-            popup=f"Location: {row['Location Name']}\nProbability: {row['Probability']:.2f}",
+            popup=f"Location: {location_name}\nProbability: {row['Probability']:.2f}",
             icon=folium.Icon(color='blue' if row['Probability'] > 0.5 else 'red')
         ).add_to(map_bamberg)
 
