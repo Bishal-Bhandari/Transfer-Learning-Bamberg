@@ -43,7 +43,8 @@ def prepare_graph_data(df, graph, nodes):
     valid_indices = node_features.index
 
     # Filter edges to include only valid node indices
-    edges = [(u, v) for u, v in graph.edges if u in valid_indices and v in valid_indices]
+    edges = [(u, v) for u, v, *_ in graph.edges if u in valid_indices and v in valid_indices]
+
     edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
 
     # Ensure alignment of `node_features` with PyTorch tensors
