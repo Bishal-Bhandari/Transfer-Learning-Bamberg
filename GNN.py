@@ -40,7 +40,7 @@ def prepare_graph_data(df, graph, nodes):
     node_features.loc[df['Node_ID'], 'Density'] = df['Normalized_Density'].values
 
     # Filter the graph to include only valid node indices
-    valid_indices = set(node_features.index)
+    valid_indices = list(node_features.index)  # Convert to list
     filtered_edges = [(u, v) for u, v, *_ in graph.edges if u in valid_indices and v in valid_indices]
 
     # Create edge_index tensor
@@ -59,6 +59,7 @@ def prepare_graph_data(df, graph, nodes):
     # Return the PyTorch Geometric data object
     data = Data(x=x, edge_index=edge_index)
     return data, df
+
 
 
 
