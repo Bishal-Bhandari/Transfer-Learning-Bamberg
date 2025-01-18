@@ -5,7 +5,7 @@ import torch
 from sklearn.preprocessing import MinMaxScaler
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import mean_absolute_error, accuracy_score
 import numpy as np
 
 
@@ -83,8 +83,7 @@ class GCN(torch.nn.Module):
 
 
 # Step 5: Train and Predict
-
-def train_gnn(data, epochs=100, lr=0.01):
+def train_gnn(data, df, actual_values, epochs=100, lr=0.01):
     model = GCN(input_dim=1, hidden_dim=16, output_dim=1)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = torch.nn.BCELoss()
@@ -96,7 +95,21 @@ def train_gnn(data, epochs=100, lr=0.01):
         loss = loss_fn(out, data.x)
         loss.backward()
         optimizer.step()
-        print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item():.4f}")
+
+        # Calculate MAE and Accuracy after aligning predictions and actual values
+        predictions = out.squeeze().detach().numpy()
+
+        # Ensure we align predictions with the actual values based on Node_ID
+        df_predictions = df.set_index('Node_ID').reindex(df['Node_ID'])  # Ensure 'Node_ID' alignment
+        aligned_actuals = df_predictions['Normalized_Density'].values
+        aligned_predictions = predictions[:len(aligned_actuals)]  # Only use the corresponding predictions
+
+        # Calculate MAE and accuracy
+        mae = mean_absolute_error(aligned_actuals, aligned_predictions)
+        accuracy = accuracy_score((aligned_predictions > 0.5).astype(int), (aligned_actuals > 0.5).astype(int))
+
+        print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item():.4f}, MAE: {mae:.4f}, Accuracy: {accuracy * 100:.2f}%")
+
     return model
 
 
@@ -114,7 +127,7 @@ def predict_gnn(model, data, df):
     return df
 
 
-# Step 7: Visualize Results
+# Step 6: Visualize Results
 def visualize_results(df, output_html):
     map_bamberg = folium.Map(location=[49.8988, 10.9028], zoom_start=13)
 
@@ -129,7 +142,7 @@ def visualize_results(df, output_html):
     map_bamberg.save(output_html)
 
 
-# Step 8: Main Function
+# Step 7: Main Function
 def main():
     # File paths
     input_file = "Training Data/final_busStop_density.ods"
@@ -145,8 +158,11 @@ def main():
     # Prepare graph data
     data, df = prepare_graph_data(df, graph, nodes)
 
-    # Train GNN model
-    model = train_gnn(data)
+    # Get actual values for MAE and accuracy calculation
+    actual_values = df['Normalized_Density'].values
+
+    # Train GNN model and calculate performance metrics
+    model = train_gnn(data, df, actual_values)
 
     # Predict probabilities
     df = predict_gnn(model, data, df)
