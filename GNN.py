@@ -9,7 +9,7 @@ from sklearn.metrics import mean_absolute_error, accuracy_score
 import numpy as np
 
 
-# Step 1: Load ODS File and Normalize Data
+# Load ODS file and Normalize it 1
 def load_data(file_path):
     df = pd.read_excel(file_path, engine='odf')
     scaler = MinMaxScaler()
@@ -17,35 +17,35 @@ def load_data(file_path):
     return df
 
 
-# Step 2: Load OSM Data
+# Load OSM data 2
 def get_osm_data():
     graph = ox.graph_from_place("Bamberg, Germany", network_type='drive')
     nodes, edges = ox.graph_to_gdfs(graph)
     return graph, nodes, edges
 
 
-# Step 3: Prepare Data for GNN
+# Prepare data for GNN 3
 def prepare_graph_data(df, graph, nodes):
     # Map lat/long to nearest OSM nodes
     df['Node_ID'] = df.apply(
         lambda row: ox.distance.nearest_nodes(graph, row['Longitude'], row['Latitude']), axis=1
     )
 
-    # Explicitly cast Node_ID to int
+    # cast Node_ID to int
     df['Node_ID'] = df['Node_ID'].astype(int)
 
-    # Create node features (normalized density mapped to graph nodes)
+    # normalized density mapped to graph nodes
     node_features = pd.DataFrame(index=nodes.index)
     node_features['Density'] = 0
 
-    # Assign normalized density to corresponding node IDs
+    # assign normalized density to corresponding node
     node_features.loc[df['Node_ID'], 'Density'] = df['Normalized_Density'].values.astype(int)
 
-    # Filter the graph to include only valid node indices
+    # Filter to include  valid node
     valid_indices = list(node_features.index)  # Convert to list
     filtered_edges = [(u, v) for u, v, *_ in graph.edges if u in valid_indices and v in valid_indices]
 
-    # Reindex edges to match the valid node indices
+    # Reindex edges to the valid node
     node_id_map = {old_id: new_id for new_id, old_id in enumerate(valid_indices)}
     reindexed_edges = [(node_id_map[u], node_id_map[v]) for u, v in filtered_edges]
 
@@ -62,12 +62,12 @@ def prepare_graph_data(df, graph, nodes):
     if edge_index.numel() > 0 and edge_index.max() >= x.size(0):
         raise ValueError(f"Edge indices exceed node features size: max index {edge_index.max()}, node size {x.size(0)}")
 
-    # Return the PyTorch Geometric data object
+    # Return the PyTorch Geometric object
     data = Data(x=x, edge_index=edge_index)
     return data, df
 
 
-# Step 4: Define GNN Model
+# Define GNN Model 4
 class GCN(torch.nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
         super(GCN, self).__init__()
@@ -82,7 +82,7 @@ class GCN(torch.nn.Module):
         return torch.sigmoid(x)
 
 
-# Step 5: Train and Predict
+# Train and Predict 5
 def train_gnn(data, df, actual_values, epochs=100, lr=0.01):
     model = GCN(input_dim=1, hidden_dim=16, output_dim=1)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -96,13 +96,12 @@ def train_gnn(data, df, actual_values, epochs=100, lr=0.01):
         loss.backward()
         optimizer.step()
 
-        # Calculate MAE and Accuracy after aligning predictions and actual values
+        # Calculate MAE and accuracy
         predictions = out.squeeze().detach().numpy()
 
-        # Ensure we align predictions with the actual values based on Node_ID
-        df_predictions = df.set_index('Node_ID').reindex(df['Node_ID'])  # Ensure 'Node_ID' alignment
+        df_predictions = df.set_index('Node_ID').reindex(df['Node_ID'])  # aligning 'Node_ID'
         aligned_actuals = df_predictions['Normalized_Density'].values
-        aligned_predictions = predictions[:len(aligned_actuals)]  # Only use the corresponding predictions
+        aligned_predictions = predictions[:len(aligned_actuals)]  #  using the corresponding predictions
 
         # Calculate MAE and accuracy
         mae = mean_absolute_error(aligned_actuals, aligned_predictions)
@@ -118,21 +117,21 @@ def predict_gnn(model, data, df):
     with torch.no_grad():
         predictions = model(data).squeeze().numpy()
 
-        # Create a Series with the predictions and align it with df['Node_ID']
+        # Creating a series with the predictions and align it with df['Node_ID']
         node_predictions = pd.Series(predictions, index=range(len(predictions)))  # Use an integer range as the index
         node_predictions = node_predictions.reindex(df['Node_ID']).values  # Align predictions with df['Node_ID']
 
-        # Set the predictions as the 'Probability' column in df
+        # Setting the predictions as the 'Probability' column in df
         df['Probability'] = node_predictions
     return df
 
 
-# Step 6: Visualize Results
+# Visualize Results 6
 def visualize_results(df, output_html):
     map_bamberg = folium.Map(location=[49.8988, 10.9028], zoom_start=13)
 
     for _, row in df.iterrows():
-        location_name = row.get('Location Name', 'Unknown Location')  # Fallback if 'Location Name' doesn't exist
+        location_name = row.get('Location Name', 'Unknown Location')  # revert if 'Location Name' doesn't exist
         folium.Marker(
             location=[row['Latitude'], row['Longitude']],
             popup=f"Location: {location_name}\nProbability: {row['Probability']:.2f}",
@@ -142,7 +141,7 @@ def visualize_results(df, output_html):
     map_bamberg.save(output_html)
 
 
-# Step 7: Main Function
+# Main Function 7
 def main():
     # File paths
     input_file = "Training Data/final_busStop_density.ods"
@@ -158,10 +157,10 @@ def main():
     # Prepare graph data
     data, df = prepare_graph_data(df, graph, nodes)
 
-    # Get actual values for MAE and accuracy calculation
+    # values for MAE and accuracy calculation
     actual_values = df['Normalized_Density'].values
 
-    # Train GNN model and calculate performance metrics
+    # Train GNN model and calculate performance
     model = train_gnn(data, df, actual_values)
 
     # Predict probabilities
