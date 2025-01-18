@@ -5,6 +5,8 @@ import torch
 from sklearn.preprocessing import MinMaxScaler
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import numpy as np
 
 
 # Step 1: Load ODS File and Normalize Data
@@ -37,7 +39,7 @@ def prepare_graph_data(df, graph, nodes):
     node_features['Density'] = 0
 
     # Assign normalized density to corresponding node IDs
-    node_features.loc[df['Node_ID'], 'Density'] = df['Normalized_Density'].values.astype(float)
+    node_features.loc[df['Node_ID'], 'Density'] = df['Normalized_Density'].values.astype(int)
 
     # Filter the graph to include only valid node indices
     valid_indices = list(node_features.index)  # Convert to list
@@ -112,7 +114,35 @@ def predict_gnn(model, data, df):
     return df
 
 
-# Step 6: Visualize Results
+# Step 6: Calculate Performance Metrics
+# Step 6: Calculate Performance Metrics
+def calculate_performance_metrics(actuals, predictions):
+    # Remove NaN values by aligning both actuals and predictions
+    valid_indices = ~np.isnan(actuals) & ~np.isnan(predictions)  # Find indices where both are not NaN
+    actuals = actuals[valid_indices]
+    predictions = predictions[valid_indices]
+
+    # If after removing NaNs, no valid data is left, return None or some default value
+    if len(actuals) == 0 or len(predictions) == 0:
+        raise ValueError("No valid data left for performance calculation after removing NaNs.")
+
+    # Calculate MAE, MSE, RMSE, and R²
+    mae = mean_absolute_error(actuals, predictions)
+    mse = mean_squared_error(actuals, predictions)
+    rmse = np.sqrt(mse)
+    r2 = r2_score(actuals, predictions)
+
+    # Return all metrics as a dictionary
+    return {
+        "MAE": mae,
+        "MSE": mse,
+        "RMSE": rmse,
+        "R²": r2
+    }
+
+
+
+# Step 7: Visualize Results
 def visualize_results(df, output_html):
     map_bamberg = folium.Map(location=[49.8988, 10.9028], zoom_start=13)
 
@@ -127,7 +157,7 @@ def visualize_results(df, output_html):
     map_bamberg.save(output_html)
 
 
-# Step 7: Main Function
+# Step 8: Main Function
 def main():
     # File paths
     input_file = "Training Data/final_busStop_density.ods"
@@ -148,6 +178,16 @@ def main():
 
     # Predict probabilities
     df = predict_gnn(model, data, df)
+
+    # Calculate performance metrics
+    actuals = df['Normalized_Density'].values
+    predictions = df['Probability'].values
+    metrics = calculate_performance_metrics(actuals, predictions)
+
+    # Print performance metrics
+    print("Performance Metrics:")
+    for metric, value in metrics.items():
+        print(f"{metric}: {value}")
 
     # Save results
     df.to_excel(output_file, engine='odf')
