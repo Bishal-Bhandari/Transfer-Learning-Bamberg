@@ -43,8 +43,12 @@ def prepare_graph_data(df, graph, nodes):
     valid_indices = list(node_features.index)  # Convert to list
     filtered_edges = [(u, v) for u, v, *_ in graph.edges if u in valid_indices and v in valid_indices]
 
+    # Reindex edges to match the valid node indices
+    node_id_map = {old_id: new_id for new_id, old_id in enumerate(valid_indices)}
+    reindexed_edges = [(node_id_map[u], node_id_map[v]) for u, v in filtered_edges]
+
     # Create edge_index tensor
-    edge_index = torch.tensor(filtered_edges, dtype=torch.long).t().contiguous()
+    edge_index = torch.tensor(reindexed_edges, dtype=torch.long).t().contiguous()
 
     # Filter node_features to match the graph nodes
     node_features = node_features.loc[valid_indices]
@@ -59,6 +63,7 @@ def prepare_graph_data(df, graph, nodes):
     # Return the PyTorch Geometric data object
     data = Data(x=x, edge_index=edge_index)
     return data, df
+
 
 
 
