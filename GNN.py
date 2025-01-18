@@ -108,10 +108,11 @@ def predict_gnn(model, data, df):
     with torch.no_grad():
         predictions = model(data).squeeze().numpy()
 
-        # Fix: Align predictions with Node_ID using .reindex()
-        node_predictions = pd.Series(predictions, index=data.x.index).reindex(df['Node_ID']).values
+        # Fix: Align predictions with Node_ID using `df['Node_ID']`
+        node_predictions = pd.Series(predictions, index=df['Node_ID']).reindex(df['Node_ID']).values
         df['Probability'] = node_predictions
     return df
+
 
 
 # Step 6: Visualize Results
