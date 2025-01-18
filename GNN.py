@@ -33,17 +33,26 @@ def prepare_graph_data(df, graph, nodes):
     node_features = pd.DataFrame(index=nodes.index)
     node_features['Density'] = 0
 
-    # Fix: Use .loc to align the values correctly
+    # Fix: Use .loc to align the values correctly and ensure valid indices
     node_features.loc[df['Node_ID'], 'Density'] = df['Normalized_Density'].values
 
-    # Create PyTorch Geometric data object
-    edge_index = torch.tensor(list(graph.edges), dtype=torch.long).t().contiguous()
+    # Ensure all indices in node_features match with graph nodes
+    valid_indices = node_features.index
+
+    # Filter edges to include only valid node indices
+    edges = [(u, v) for u, v in graph.edges if u in valid_indices and v in valid_indices]
+    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
 
     # Fix: Ensure alignment of `node_features` with PyTorch tensors
     x = torch.tensor(node_features['Density'].fillna(0).values, dtype=torch.float).view(-1, 1)
 
+    # Ensure `edge_index` is non-empty
+    if edge_index.numel() == 0:
+        raise ValueError("No valid edges found in the graph. Check the input data.")
+
     data = Data(x=x, edge_index=edge_index)
     return data, df
+
 
 
 # Step 4: Define GNN Model
