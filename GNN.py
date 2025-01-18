@@ -25,16 +25,23 @@ def get_osm_data():
 # Step 3: Prepare Data for GNN
 def prepare_graph_data(df, graph, nodes):
     # Map lat/long to nearest OSM nodes
-    df['Node_ID'] = df.apply(lambda row: ox.distance.nearest_nodes(graph, row['Longitude'], row['Latitude']), axis=1)
+    df['Node_ID'] = df.apply(
+        lambda row: ox.distance.nearest_nodes(graph, row['Longitude'], row['Latitude']), axis=1
+    )
 
     # Create node features (normalized density mapped to graph nodes)
     node_features = pd.DataFrame(index=nodes.index)
     node_features['Density'] = 0
+
+    # Fix: Use .loc to align the values correctly
     node_features.loc[df['Node_ID'], 'Density'] = df['Normalized_Density'].values
 
     # Create PyTorch Geometric data object
     edge_index = torch.tensor(list(graph.edges), dtype=torch.long).t().contiguous()
-    x = torch.tensor(node_features['Density'].values, dtype=torch.float).view(-1, 1)
+
+    # Fix: Ensure alignment of `node_features` with PyTorch tensors
+    x = torch.tensor(node_features['Density'].fillna(0).values, dtype=torch.float).view(-1, 1)
+
     data = Data(x=x, edge_index=edge_index)
     return data, df
 
@@ -76,7 +83,10 @@ def predict_gnn(model, data, df):
     model.eval()
     with torch.no_grad():
         predictions = model(data).squeeze().numpy()
-        df['Probability'] = predictions[df['Node_ID']]
+
+        # Fix: Align predictions with Node_ID using .reindex()
+        node_predictions = pd.Series(predictions, index=data.x.index).reindex(df['Node_ID']).values
+        df['Probability'] = node_predictions
     return df
 
 
