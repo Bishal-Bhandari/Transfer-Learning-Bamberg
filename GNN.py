@@ -39,23 +39,27 @@ def prepare_graph_data(df, graph, nodes):
     # Assign normalized density to corresponding node IDs
     node_features.loc[df['Node_ID'], 'Density'] = df['Normalized_Density'].values
 
-    # Ensure all indices in node_features match with graph nodes
-    valid_indices = node_features.index
+    # Filter the graph to include only valid node indices
+    valid_indices = set(node_features.index)
+    filtered_edges = [(u, v) for u, v, *_ in graph.edges if u in valid_indices and v in valid_indices]
 
-    # Filter edges to include only valid node indices
-    edges = [(u, v) for u, v, *_ in graph.edges if u in valid_indices and v in valid_indices]
+    # Create edge_index tensor
+    edge_index = torch.tensor(filtered_edges, dtype=torch.long).t().contiguous()
 
-    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+    # Filter node_features to match the graph nodes
+    node_features = node_features.loc[valid_indices]
 
-    # Ensure alignment of `node_features` with PyTorch tensors
+    # Create feature tensor
     x = torch.tensor(node_features['Density'].fillna(0).values, dtype=torch.float).view(-1, 1)
 
-    # Ensure `edge_index` is non-empty
-    if edge_index.numel() == 0:
-        raise ValueError("No valid edges found in the graph. Check the input data.")
+    # Validate edge_index range
+    if edge_index.numel() > 0 and edge_index.max() >= x.size(0):
+        raise ValueError(f"Edge indices exceed node features size: max index {edge_index.max()}, node size {x.size(0)}")
 
+    # Return the PyTorch Geometric data object
     data = Data(x=x, edge_index=edge_index)
     return data, df
+
 
 
 
