@@ -29,11 +29,14 @@ def prepare_graph_data(df, graph, nodes):
         lambda row: ox.distance.nearest_nodes(graph, row['Longitude'], row['Latitude']), axis=1
     )
 
+    # Explicitly cast Node_ID to int
+    df['Node_ID'] = df['Node_ID'].astype(int)
+
     # Create node features (normalized density mapped to graph nodes)
     node_features = pd.DataFrame(index=nodes.index)
     node_features['Density'] = 0
 
-    # Fix: Use .loc to align the values correctly and ensure valid indices
+    # Assign normalized density to corresponding node IDs
     node_features.loc[df['Node_ID'], 'Density'] = df['Normalized_Density'].values
 
     # Ensure all indices in node_features match with graph nodes
@@ -43,7 +46,7 @@ def prepare_graph_data(df, graph, nodes):
     edges = [(u, v) for u, v in graph.edges if u in valid_indices and v in valid_indices]
     edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
 
-    # Fix: Ensure alignment of `node_features` with PyTorch tensors
+    # Ensure alignment of `node_features` with PyTorch tensors
     x = torch.tensor(node_features['Density'].fillna(0).values, dtype=torch.float).view(-1, 1)
 
     # Ensure `edge_index` is non-empty
@@ -52,6 +55,7 @@ def prepare_graph_data(df, graph, nodes):
 
     data = Data(x=x, edge_index=edge_index)
     return data, df
+
 
 
 
