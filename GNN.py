@@ -51,7 +51,7 @@ def prepare_graph_data_with_candidates(df, graph, nodes, candidates):
 
     node_features = pd.DataFrame(index=nodes.index)
     node_features['Density'] = 0
-    node_features.loc[combined_df['Node_ID'], 'Density'] = combined_df['Density'].values
+    node_features.loc[combined_df['Node_ID'], 'Density'] = combined_df['Density'].astype(float).values
 
     valid_indices = list(node_features.index)
     filtered_edges = [(u, v) for u, v, *_ in graph.edges if u in valid_indices and v in valid_indices]
