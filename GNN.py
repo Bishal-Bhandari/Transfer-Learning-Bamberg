@@ -51,7 +51,7 @@ def prepare_graph_data_with_candidates(df, graph, nodes, candidates):
 
     node_features = pd.DataFrame(index=nodes.index)
     node_features['Density'] = 0
-    node_features.loc[combined_df['Node_ID'], 'Density'] = combined_df['Density'].astype(float).values
+    node_features.loc[combined_df['Node_ID'], 'Density'] = combined_df['Density'].astype(int).values
 
     valid_indices = list(node_features.index)
     filtered_edges = [(u, v) for u, v, *_ in graph.edges if u in valid_indices and v in valid_indices]
@@ -112,6 +112,21 @@ def predict_candidates(model, data, candidates):
     return candidates
 
 
+# Adjust predictions to nearest road nodes
+def adjust_predictions_to_road(df, graph):
+    """
+    Adjust predicted bus stop locations to the nearest road node using the OSM graph.
+    """
+    df['Adjusted_Node_ID'] = df.apply(
+        lambda row: ox.distance.nearest_nodes(graph, row['Longitude'], row['Latitude']), axis=1
+    )
+
+    df['Adjusted_Latitude'] = df['Adjusted_Node_ID'].map(graph.nodes).apply(lambda x: x['y'])
+    df['Adjusted_Longitude'] = df['Adjusted_Node_ID'].map(graph.nodes).apply(lambda x: x['x'])
+
+    return df
+
+
 # Visualize Results
 def visualize_candidate_predictions(candidates, output_html):
     map_bamberg = folium.Map(location=[49.8988, 10.9028], zoom_start=13)
@@ -141,6 +156,8 @@ def main():
     model = train_gnn(data, df)
 
     candidates = predict_candidates(model, data, candidates)
+
+    candidates = adjust_predictions_to_road(candidates, graph)
 
     candidates.to_excel(output_file, engine='odf')
     visualize_candidate_predictions(candidates, output_html)
