@@ -26,9 +26,9 @@ def get_osm_data():
 
 
 # Generate Candidate Locations
-def generate_candidate_locations(center_lat, center_lon, radius, num_points):
-    lat_range = np.linspace(center_lat - radius, center_lat + radius, num_points)
-    lon_range = np.linspace(center_lon - radius, center_lon + radius, num_points)
+def generate_candidate_locations(center_lat, center_lon, lat_radius, lon_radius, num_points):
+    lat_range = np.linspace(center_lat - lat_radius, center_lat + lat_radius, num_points)
+    lon_range = np.linspace(center_lon - lon_radius, center_lon + lon_radius, num_points)
     candidates = [(lat, lon) for lat in lat_range for lon in lon_range]
     return pd.DataFrame(candidates, columns=["Latitude", "Longitude"])
 
@@ -104,12 +104,23 @@ def train_gnn(data, df, epochs=300, lr=0.01):
 
 # Predict Candidates
 def predict_candidates(model, data, candidates):
+    """
+    Predict probabilities for candidate nodes.
+    Extracts predictions for the last N nodes, which correspond to the candidates.
+    """
     model.eval()
     with torch.no_grad():
         predictions = model(data).squeeze().numpy()
-        candidates['Prediction'] = predictions[-len(candidates):]
-        candidates['Predicted_Stop'] = (candidates['Prediction'] > 0.5).astype(int)
+
+        # Extract predictions for the candidate nodes (last len(candidates))
+        candidate_predictions = predictions[-len(candidates):]
+
+        # Add predictions to the candidates DataFrame
+        candidates['Prediction'] = candidate_predictions
+        candidates['Predicted_Stop'] = (candidate_predictions > 0.5).astype(int)
+
     return candidates
+
 
 
 # Adjust predictions to nearest road nodes
@@ -168,7 +179,8 @@ def main():
     df = load_data(input_file)
     graph, nodes, _ = get_osm_data()
 
-    candidates = generate_candidate_locations(49.8988, 10.9028, 0.01, 10)
+    candidates = generate_candidate_locations(49.8988, 10.9028, 0.045, 0.07, 50)
+
     candidates = assign_density_to_candidates(candidates, df)
 
     data, combined_df = prepare_graph_data_with_candidates(df, graph, nodes, candidates)
@@ -187,4 +199,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
