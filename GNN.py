@@ -113,33 +113,53 @@ def predict_candidates(model, data, candidates):
 
 
 # Adjust predictions to nearest road nodes
-def adjust_predictions_to_road(df, graph):
+def adjust_predictions_to_road(candidates, graph):
     """
-    Adjust predicted bus stop locations to the nearest road node using the OSM graph.
+    Snap predicted locations to the nearest road nodes using the OSM graph.
+    Updates latitude and longitude to match the nearest road node's coordinates.
     """
-    df['Adjusted_Node_ID'] = df.apply(
-        lambda row: ox.distance.nearest_nodes(graph, row['Longitude'], row['Latitude']), axis=1
+    # Snap each candidate to the nearest node on the road network
+    candidates['Adjusted_Node_ID'] = candidates.apply(
+        lambda row: ox.distance.nearest_nodes(graph, X=row['Longitude'], Y=row['Latitude']), axis=1
     )
 
-    df['Adjusted_Latitude'] = df['Adjusted_Node_ID'].map(graph.nodes).apply(lambda x: x['y'])
-    df['Adjusted_Longitude'] = df['Adjusted_Node_ID'].map(graph.nodes).apply(lambda x: x['x'])
+    # Map the snapped node IDs back to their coordinates in the graph
+    candidates['Adjusted_Latitude'] = candidates['Adjusted_Node_ID'].map(
+        lambda node_id: graph.nodes[node_id]['y'] if node_id in graph.nodes else np.nan
+    )
+    candidates['Adjusted_Longitude'] = candidates['Adjusted_Node_ID'].map(
+        lambda node_id: graph.nodes[node_id]['x'] if node_id in graph.nodes else np.nan
+    )
 
-    return df
+    # Drop candidates where snapping failed (e.g., outside the graph area)
+    candidates = candidates.dropna(subset=['Adjusted_Latitude', 'Adjusted_Longitude']).reset_index(drop=True)
+    return candidates
 
 
-# Visualize Results
+# Visualize Results (Updated for Adjusted Points)
 def visualize_candidate_predictions(candidates, output_html):
+    """
+    Visualize candidate predictions and their adjusted locations on a map.
+    """
     map_bamberg = folium.Map(location=[49.8988, 10.9028], zoom_start=13)
     for _, row in candidates.iterrows():
+        # Original prediction marker (red if not snapped)
         folium.Marker(
             location=[row['Latitude'], row['Longitude']],
-            popup=f"Density: {row['Density']:.2f}, Prediction: {row['Prediction']:.2f}",
-            icon=folium.Icon(color='blue' if row['Predicted_Stop'] else 'red')
+            popup=f"Original Location - Density: {row['Density']:.2f}",
+            icon=folium.Icon(color='red', icon='circle')
+        ).add_to(map_bamberg)
+
+        # Adjusted location marker (blue for snapped)
+        folium.Marker(
+            location=[row['Adjusted_Latitude'], row['Adjusted_Longitude']],
+            popup=f"Snapped Location - Prediction: {row['Prediction']:.2f}",
+            icon=folium.Icon(color='blue', icon='ok-sign')
         ).add_to(map_bamberg)
     map_bamberg.save(output_html)
 
 
-# Main Function
+# Main Function (Updated Integration)
 def main():
     input_file = "Training Data/final_busStop_density.ods"
     output_file = "Model Data/GNN-predicted_candidates.ods"
@@ -157,6 +177,7 @@ def main():
 
     candidates = predict_candidates(model, data, candidates)
 
+    # Snap predicted locations to the road network
     candidates = adjust_predictions_to_road(candidates, graph)
 
     candidates.to_excel(output_file, engine='odf')
@@ -166,3 +187,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
