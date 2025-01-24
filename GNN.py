@@ -27,6 +27,9 @@ def get_osm_data():
 
 # Generate Candidate Locations
 def generate_candidate_locations(df, center_lat, center_lon, radius_km, high_density_threshold=0.7, base_points=10):
+    """
+    Generate more candidate locations in high-density areas and at least one in low-density areas.
+    """
     # Convert radius to degrees
     lat_radius = radius_km / 111
     lon_radius = radius_km / (111 * np.cos(np.radians(center_lat)))
@@ -41,13 +44,13 @@ def generate_candidate_locations(df, center_lat, center_lon, radius_km, high_den
         for lon in np.linspace(center_lon - lon_radius, center_lon + lon_radius, base_points * 2)
     ], columns=["Latitude", "Longitude"])
 
-    # Generate fewer candidates for low-density areas (ensure at least one per low-density point)
-    low_density_candidates = low_density.copy()
-    low_density_candidates = low_density_candidates[['Latitude', 'Longitude']].reset_index(drop=True)
+    # Ensure at least one candidate for each low-density location
+    low_density_candidates = low_density[['Latitude', 'Longitude']].drop_duplicates()
 
-    # Combine candidates
+    # Combine high- and low-density candidates
     all_candidates = pd.concat([high_density_candidates, low_density_candidates], ignore_index=True)
     return all_candidates
+
 
 
 
@@ -190,22 +193,31 @@ def main():
     output_file = "Model Data/GNN-predicted_candidates.ods"
     output_html = "Template/GNN-candidate_predictions.html"
 
+    # Load the density data
     df = load_data(input_file)
+
+    # Load the road network graph
     graph, nodes, _ = get_osm_data()
 
-    candidates = generate_candidate_locations(49.8988, 10.9028, 5, 10)  # 5 km radius, 10x10 grid
+    # Generate candidates based on density
+    candidates = generate_candidate_locations(df, 49.8988, 10.9028, 5, high_density_threshold=0.7, base_points=10)
 
+    # Assign density to the generated candidates
     candidates = assign_density_to_candidates(candidates, df)
 
+    # Prepare graph data with candidates
     data, combined_df = prepare_graph_data_with_candidates(df, graph, nodes, candidates)
 
+    # Train the GNN model
     model = train_gnn(data, df)
 
+    # Predict probabilities for candidates
     candidates = predict_candidates(model, data, candidates)
 
     # Snap predicted locations to the road network
     candidates = adjust_predictions_to_road(candidates, graph)
 
+    # Save and visualize results
     candidates.to_excel(output_file, engine='odf')
     visualize_candidate_predictions(candidates, output_html)
     print(f"Results saved to {output_file} and visualized in {output_html}")
