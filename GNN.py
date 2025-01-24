@@ -27,18 +27,6 @@ def get_osm_data():
 
 # Generate Candidate Locations
 def generate_candidate_locations(center_lat, center_lon, radius_km, num_points):
-    """
-    Generate candidate locations within a 5 km radius.
-
-    Parameters:
-        center_lat: Latitude of the center point.
-        center_lon: Longitude of the center point.
-        radius_km: Radius in kilometers.
-        num_points: Number of candidate points along each axis.
-
-    Returns:
-        A DataFrame of candidate locations.
-    """
     # Convert radius in kilometers to degrees
     lat_radius = radius_km / 111  # 1 degree latitude ≈ 111 km
     lon_radius = radius_km / (111 * np.cos(np.radians(center_lat)))  # Adjust for longitude at given latitude
@@ -151,9 +139,6 @@ def adjust_predictions_to_road(candidates, graph):
 
 # Visualize Results (Updated for Adjusted Points)
 def visualize_candidate_predictions(candidates, output_html):
-    """
-    Visualize candidate predictions and their adjusted locations on a map.
-    """
     map_bamberg = folium.Map(location=[49.8988, 10.9028], zoom_start=13)
     for _, row in candidates.iterrows():
         # Original prediction marker (red if not snapped)
