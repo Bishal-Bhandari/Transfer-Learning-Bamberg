@@ -177,7 +177,7 @@ def adjust_predictions_to_road(candidates, graph):
 def visualize_candidate_predictions(candidates, output_html):
     map_bamberg = folium.Map(location=[49.8988, 10.9028], zoom_start=13)
     for _, row in candidates.iterrows():
-        color = 'blue' if row['Density'] >= 0.7 else 'green'
+        color = 'blue' if row['Density'] >= 0.7 else 'red'
         folium.Marker(
             location=[row['Adjusted_Latitude'], row['Adjusted_Longitude']],
             popup=f"Adjusted Location - Prediction: {row['Prediction']:.2f}, Density: {row['Density']:.2f}",
