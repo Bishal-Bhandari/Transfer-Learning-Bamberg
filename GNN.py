@@ -87,22 +87,45 @@ def prepare_graph_data_with_candidates(df, graph, nodes, candidates):
 
 # Define GNN Model
 class GCN(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
         super(GCN, self).__init__()
-        self.conv1 = GCNConv(input_dim, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, output_dim)
+
+        # Number of layers can be adjusted
+        self.num_layers = num_layers
+        self.convs = torch.nn.ModuleList()
+
+        # Input layer
+        self.convs.append(GCNConv(input_dim, hidden_dim))
+
+        # Hidden layers
+        for _ in range(num_layers - 2):  # For intermediate layers (excluding input/output)
+            self.convs.append(GCNConv(hidden_dim, hidden_dim))
+
+        # Output layer
+        self.convs.append(GCNConv(hidden_dim, output_dim))
+
+        # Dropout for regularization
+        self.dropout = torch.nn.Dropout(p=0.5)
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
-        x = self.conv1(x, edge_index)
-        x = torch.relu(x)
-        x = self.conv2(x, edge_index)
-        return torch.sigmoid(x)
+
+        # Apply each layer with ReLU activation and dropout
+        for i in range(self.num_layers - 1):  # Exclude the last layer for output
+            x = self.convs[i](x, edge_index)
+            x = torch.relu(x)
+            x = self.dropout(x)  # Apply dropout after each layer
+
+        # Output layer (no ReLU or dropout here)
+        x = self.convs[-1](x, edge_index)
+        return torch.sigmoid(x)  # Sigmoid activation for binary classification or regression
 
 
 # Train GNN
 def train_gnn(data, df, epochs=500, lr=0.01):
-    model = GCN(input_dim=1, hidden_dim=16, output_dim=1)
+    # Example usage
+    model = GCN(input_dim=1, hidden_dim=16, output_dim=1, num_layers=5)  # 5 layers in total
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     model.train()
