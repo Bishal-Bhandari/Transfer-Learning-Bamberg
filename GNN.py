@@ -232,7 +232,7 @@ def main():
     # Save and visualize results
     candidates.to_excel(output_file, engine='odf')
     visualize_candidate_predictions(candidates, output_html)
-    print(f"Results saved to {output_file} and visualized in {output_html}")
+    print(f"Done")
 
 
 if __name__ == "__main__":
