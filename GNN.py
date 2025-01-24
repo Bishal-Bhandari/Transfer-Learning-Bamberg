@@ -26,16 +26,29 @@ def get_osm_data():
 
 
 # Generate Candidate Locations
-def generate_candidate_locations(center_lat, center_lon, radius_km, num_points):
-    # Convert radius in kilometers to degrees
-    lat_radius = radius_km / 111  # 1 degree latitude ≈ 111 km
-    lon_radius = radius_km / (111 * np.cos(np.radians(center_lat)))  # Adjust for longitude at given latitude
+def generate_candidate_locations(df, center_lat, center_lon, radius_km, high_density_threshold=0.7, base_points=10):
+    # Convert radius to degrees
+    lat_radius = radius_km / 111
+    lon_radius = radius_km / (111 * np.cos(np.radians(center_lat)))
 
-    # Generate grid of candidate locations
-    lat_range = np.linspace(center_lat - lat_radius, center_lat + lat_radius, num_points)
-    lon_range = np.linspace(center_lon - lon_radius, center_lon + lon_radius, num_points)
-    candidates = [(lat, lon) for lat in lat_range for lon in lon_range]
-    return pd.DataFrame(candidates, columns=["Latitude", "Longitude"])
+    # Split the data into high-density and low-density
+    high_density = df[df['Normalized_Density'] >= high_density_threshold]
+    low_density = df[df['Normalized_Density'] < high_density_threshold]
+
+    # Generate candidates for high-density areas
+    high_density_candidates = pd.DataFrame([
+        (lat, lon) for lat in np.linspace(center_lat - lat_radius, center_lat + lat_radius, base_points * 2)
+        for lon in np.linspace(center_lon - lon_radius, center_lon + lon_radius, base_points * 2)
+    ], columns=["Latitude", "Longitude"])
+
+    # Generate fewer candidates for low-density areas (ensure at least one per low-density point)
+    low_density_candidates = low_density.copy()
+    low_density_candidates = low_density_candidates[['Latitude', 'Longitude']].reset_index(drop=True)
+
+    # Combine candidates
+    all_candidates = pd.concat([high_density_candidates, low_density_candidates], ignore_index=True)
+    return all_candidates
+
 
 
 # Assign Density to Candidates
