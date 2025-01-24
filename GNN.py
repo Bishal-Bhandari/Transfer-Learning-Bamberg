@@ -52,8 +52,6 @@ def generate_candidate_locations(df, center_lat, center_lon, radius_km, high_den
     return all_candidates
 
 
-
-
 # Assign Density to Candidates
 def assign_density_to_candidates(candidates, df):
     density_tree = cKDTree(df[['Latitude', 'Longitude']])
@@ -130,7 +128,6 @@ def train_gnn(data, df, epochs=300, lr=0.01):
     return model
 
 
-
 # Predict Candidates
 def predict_candidates(model, data, candidates, low_density_threshold=0.7):
     """
@@ -150,7 +147,6 @@ def predict_candidates(model, data, candidates, low_density_threshold=0.7):
             candidates.loc[idx, 'Predicted_Stop'] = 1
 
     return candidates
-
 
 
 # Adjust predictions to nearest road nodes
@@ -184,7 +180,6 @@ def visualize_candidate_predictions(candidates, output_html):
             icon=folium.Icon(color=color, icon='ok-sign')
         ).add_to(map_bamberg)
     map_bamberg.save(output_html)
-
 
 
 # Main Function (Updated Integration)
