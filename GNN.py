@@ -27,9 +27,6 @@ def get_osm_data():
 
 # Generate Candidate Locations
 def generate_candidate_locations(df, center_lat, center_lon, radius_km, high_density_threshold=0.7, base_points=10):
-    """
-    Generate more candidate locations in high-density areas and at least one in low-density areas.
-    """
     # Convert radius to degrees
     lat_radius = radius_km / 111
     lon_radius = radius_km / (111 * np.cos(np.radians(center_lat)))
@@ -130,9 +127,6 @@ def train_gnn(data, df, epochs=300, lr=0.01):
 
 # Predict Candidates
 def predict_candidates(model, data, candidates, low_density_threshold=0.7):
-    """
-    Predict probabilities for candidate nodes and ensure at least one bus stop in low-density areas.
-    """
     model.eval()
     with torch.no_grad():
         predictions = model(data).squeeze().numpy()
