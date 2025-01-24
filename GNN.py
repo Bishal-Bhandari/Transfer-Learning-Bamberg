@@ -101,7 +101,7 @@ class GCN(torch.nn.Module):
 
 
 # Train GNN
-def train_gnn(data, df, epochs=300, lr=0.01):
+def train_gnn(data, df, epochs=500, lr=0.01):
     model = GCN(input_dim=1, hidden_dim=16, output_dim=1)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
