@@ -26,7 +26,24 @@ def get_osm_data():
 
 
 # Generate Candidate Locations
-def generate_candidate_locations(center_lat, center_lon, lat_radius, lon_radius, num_points):
+def generate_candidate_locations(center_lat, center_lon, radius_km, num_points):
+    """
+    Generate candidate locations within a 5 km radius.
+
+    Parameters:
+        center_lat: Latitude of the center point.
+        center_lon: Longitude of the center point.
+        radius_km: Radius in kilometers.
+        num_points: Number of candidate points along each axis.
+
+    Returns:
+        A DataFrame of candidate locations.
+    """
+    # Convert radius in kilometers to degrees
+    lat_radius = radius_km / 111  # 1 degree latitude ≈ 111 km
+    lon_radius = radius_km / (111 * np.cos(np.radians(center_lat)))  # Adjust for longitude at given latitude
+
+    # Generate grid of candidate locations
     lat_range = np.linspace(center_lat - lat_radius, center_lat + lat_radius, num_points)
     lon_range = np.linspace(center_lon - lon_radius, center_lon + lon_radius, num_points)
     candidates = [(lat, lon) for lat in lat_range for lon in lon_range]
@@ -104,31 +121,16 @@ def train_gnn(data, df, epochs=300, lr=0.01):
 
 # Predict Candidates
 def predict_candidates(model, data, candidates):
-    """
-    Predict probabilities for candidate nodes.
-    Extracts predictions for the last N nodes, which correspond to the candidates.
-    """
     model.eval()
     with torch.no_grad():
         predictions = model(data).squeeze().numpy()
-
-        # Extract predictions for the candidate nodes (last len(candidates))
-        candidate_predictions = predictions[-len(candidates):]
-
-        # Add predictions to the candidates DataFrame
-        candidates['Prediction'] = candidate_predictions
-        candidates['Predicted_Stop'] = (candidate_predictions > 0.5).astype(int)
-
+        candidates['Prediction'] = predictions[-len(candidates):]
+        candidates['Predicted_Stop'] = (candidates['Prediction'] > 0.5).astype(int)
     return candidates
-
 
 
 # Adjust predictions to nearest road nodes
 def adjust_predictions_to_road(candidates, graph):
-    """
-    Snap predicted locations to the nearest road nodes using the OSM graph.
-    Updates latitude and longitude to match the nearest road node's coordinates.
-    """
     # Snap each candidate to the nearest node on the road network
     candidates['Adjusted_Node_ID'] = candidates.apply(
         lambda row: ox.distance.nearest_nodes(graph, X=row['Longitude'], Y=row['Latitude']), axis=1
@@ -164,7 +166,7 @@ def visualize_candidate_predictions(candidates, output_html):
         # Adjusted location marker (blue for snapped)
         folium.Marker(
             location=[row['Adjusted_Latitude'], row['Adjusted_Longitude']],
-            popup=f"Snapped Location - Prediction: {row['Prediction']:.2f}",
+            popup=f"Adjusted Location - Prediction: {row['Prediction']:.2f}",
             icon=folium.Icon(color='blue', icon='ok-sign')
         ).add_to(map_bamberg)
     map_bamberg.save(output_html)
@@ -179,7 +181,7 @@ def main():
     df = load_data(input_file)
     graph, nodes, _ = get_osm_data()
 
-    candidates = generate_candidate_locations(49.8988, 10.9028, 0.045, 0.07, 50)
+    candidates = generate_candidate_locations(49.8988, 10.9028, 5, 10)  # 5 km radius, 10x10 grid
 
     candidates = assign_density_to_candidates(candidates, df)
 
