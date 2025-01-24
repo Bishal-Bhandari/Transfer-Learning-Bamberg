@@ -174,20 +174,14 @@ def adjust_predictions_to_road(candidates, graph):
 def visualize_candidate_predictions(candidates, output_html):
     map_bamberg = folium.Map(location=[49.8988, 10.9028], zoom_start=13)
     for _, row in candidates.iterrows():
-        # Original prediction marker (red if not snapped)
-        folium.Marker(
-            location=[row['Latitude'], row['Longitude']],
-            popup=f"Original Location - Density: {row['Density']:.2f}",
-            icon=folium.Icon(color='red', icon='circle')
-        ).add_to(map_bamberg)
-
-        # Adjusted location marker (blue for snapped)
+        color = 'blue' if row['Density'] >= 0.7 else 'green'
         folium.Marker(
             location=[row['Adjusted_Latitude'], row['Adjusted_Longitude']],
-            popup=f"Adjusted Location - Prediction: {row['Prediction']:.2f}",
-            icon=folium.Icon(color='blue', icon='ok-sign')
+            popup=f"Adjusted Location - Prediction: {row['Prediction']:.2f}, Density: {row['Density']:.2f}",
+            icon=folium.Icon(color=color, icon='ok-sign')
         ).add_to(map_bamberg)
     map_bamberg.save(output_html)
+
 
 
 # Main Function (Updated Integration)
