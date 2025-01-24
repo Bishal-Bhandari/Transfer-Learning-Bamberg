@@ -106,28 +106,48 @@ class GCN(torch.nn.Module):
 def train_gnn(data, df, epochs=300, lr=0.01):
     model = GCN(input_dim=1, hidden_dim=16, output_dim=1)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = torch.nn.MSELoss()
 
     model.train()
     for epoch in range(epochs):
         optimizer.zero_grad()
         out = model(data)
-        loss = loss_fn(out, data.x)
+
+        # Custom loss: Higher weight for high-density areas, minimum weight for low-density areas
+        weights = data.x.squeeze()
+        min_weight = 0.1  # Ensure low-density areas have non-zero weight
+        adjusted_weights = torch.where(weights > 0, weights + min_weight, torch.tensor(min_weight))
+
+        # Weighted MSE loss
+        loss = ((adjusted_weights * (out.squeeze() - data.x.squeeze()) ** 2).mean())
         loss.backward()
         optimizer.step()
+
         print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item():.4f}")
 
     return model
 
 
+
 # Predict Candidates
-def predict_candidates(model, data, candidates):
+def predict_candidates(model, data, candidates, low_density_threshold=0.7):
+    """
+    Predict probabilities for candidate nodes and ensure at least one bus stop in low-density areas.
+    """
     model.eval()
     with torch.no_grad():
         predictions = model(data).squeeze().numpy()
         candidates['Prediction'] = predictions[-len(candidates):]
         candidates['Predicted_Stop'] = (candidates['Prediction'] > 0.5).astype(int)
+
+        # Ensure at least one bus stop in low-density areas
+        low_density_candidates = candidates[candidates['Density'] < low_density_threshold]
+        if low_density_candidates['Predicted_Stop'].sum() == 0:
+            # Select the candidate with the highest prediction in low-density areas
+            idx = low_density_candidates['Prediction'].idxmax()
+            candidates.loc[idx, 'Predicted_Stop'] = 1
+
     return candidates
+
 
 
 # Adjust predictions to nearest road nodes
