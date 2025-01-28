@@ -8,174 +8,193 @@ from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
 from scipy.spatial import cKDTree
 from tqdm import tqdm
+import geopandas as gpd
+from joblib import Parallel, delayed
+from shapely.geometry import Polygon, MultiPolygon
 
+ox.settings.log_console = True
+ox.settings.use_cache = True  # Enable caching for OSM data
 tqdm.pandas()
 
 
-# 1. Data Loading with Enhanced Features
+# 1. Optimized Data Loading
 def load_data(file_path):
-    """Load bus stop data with density information"""
-    df = pd.read_excel(file_path, engine='odf')
+    """Load data with optimized dtype handling"""
+    df = pd.read_excel(file_path, engine='odf',
+                       dtype={'Latitude': np.float32, 'Longitude': np.float32})
     scaler = MinMaxScaler()
-    df['Normalized_Density'] = scaler.fit_transform(df[['Density']])
+    df['Normalized_Density'] = scaler.fit_transform(df[['Density']]).astype(np.float32)
     return df
 
 
-# 2. OSM Data Integration with POI Collection
+# 2. Enhanced OSM Data Integration with Caching
 def get_osm_data(place_name="Bamberg, Germany"):
-    """Retrieve road network and POI data from OSM"""
-    # Get road network
-    graph = ox.graph_from_place(place_name, network_type='drive')
-    nodes, edges = ox.graph_to_gdfs(graph)
+    """Retrieve OSM data with efficient geometry handling"""
+    # Get road network with simplified graph
+    graph = ox.graph_from_place(place_name, network_type='drive', simplify=True)
+    nodes = ox.graph_to_gdfs(graph, nodes=True, edges=False)
 
-    # Get POIs - expanded categories
+    # Get POIs using predefined categories
     poi_tags = {
-        'amenity': ['school', 'hospital', 'restaurant', 'cafe', 'library'],
-        'shop': ['supermarket', 'convenience'],
-        'public_transport': ['station', 'stop_position'],
-        'office': ['company', 'government'],
-        'tourism': ['hotel', 'attraction'],
-        'leisure': ['park', 'sports_centre']
+        'amenity': ['school', 'hospital', 'restaurant', 'cafe'],
+        'shop': True,
+        'public_transport': ['station'],
+        'tourism': ['hotel', 'attraction']
     }
+
     pois = ox.features_from_place(place_name, poi_tags)
+    pois = pois[pois.geometry.notnull()].copy()
+
+    # Updated geometry handling with proper type checking
+    def convert_geometry(g):
+        if isinstance(g, (Polygon, MultiPolygon)):
+            return g.centroid
+        return g
+
+    pois['geometry'] = pois.geometry.apply(convert_geometry)
+    pois = pois.explode(index_parts=True).reset_index(drop=True)
+    pois = pois[pois.geometry.type == 'Point'].copy()
+
     return graph, nodes, pois
 
 
-# 3. Feature Engineering with POI Density
-def calculate_poi_density(candidates, pois, radius=500):
-    """Calculate POI density around candidate points with proper geometry handling"""
-    # Convert radius to approximate degrees
-    radius_deg = radius / 111139
-
-    # Extract coordinates from all geometry types
-    poi_coords = []
-    for geom in pois.geometry:
-        if geom.geom_type == 'Point':
-            poi_coords.append((geom.y, geom.x))
-        elif geom.geom_type in ['MultiPoint', 'LineString', 'MultiLineString']:
-            for point in geom.geoms:
-                if hasattr(point, 'coords'):
-                    poi_coords.append((point.y, point.x))
-        elif geom.geom_type in ['Polygon', 'MultiPolygon']:
-            # Use centroid for area features
-            centroid = geom.centroid
-            poi_coords.append((centroid.y, centroid.x))
-
-    if not poi_coords:  # Handle case with no POIs
+# 3. Parallel POI Density Calculation
+def calculate_poi_density_parallel(candidates, pois, radius=500, n_jobs=-1):
+    """Parallel POI density calculation with UTM projection"""
+    if pois.empty:
         candidates['POI_Count'] = 0
         return candidates
 
-    # Create spatial index
-    tree = cKDTree(poi_coords)
-
-    # Query POIs for each candidate
-    counts = tree.query_ball_point(
-        candidates[['Latitude', 'Longitude']].values,
-        r=radius_deg,
-        return_length=True
+    # Convert to GeoDataFrames
+    candidates_gdf = gpd.GeoDataFrame(
+        candidates,
+        geometry=gpd.points_from_xy(candidates.Longitude, candidates.Latitude),
+        crs="EPSG:4326"
     )
 
-    candidates['POI_Count'] = counts
+    # Find UTM CRS using GeoPandas
+    utm_crs = candidates_gdf.estimate_utm_crs()
+
+    # Project to UTM
+    candidates_utm = candidates_gdf.to_crs(utm_crs)
+    pois_utm = pois.to_crs(utm_crs)
+
+    # Create spatial index
+    poi_coords = np.array([(geom.x, geom.y) for geom in pois_utm.geometry])
+    tree = cKDTree(poi_coords)
+
+    def count_pois(row):
+        point = row.geometry
+        return len(tree.query_ball_point([point.x, point.y], r=radius))
+
+    # Parallel processing
+    candidates_utm['POI_Count'] = Parallel(n_jobs=n_jobs)(
+        delayed(count_pois)(row) for _, row in tqdm(candidates_utm.iterrows(), total=len(candidates_utm))
+    )
+
+    # Merge results back
+    return candidates.merge(
+        candidates_utm[['POI_Count']],
+        left_index=True,
+        right_index=True
+    )
+
+
+# 4. Optimized Candidate Generation using Road Network
+def generate_candidates(graph, existing_stops, search_radius_km=5):
+    """Generate candidates based on road network nodes with proper node ID handling"""
+    # Convert existing stops to nodes
+    if 'node_id' not in existing_stops.columns:
+        # Add node_id to existing stops if missing
+        existing_stops['geometry'] = gpd.points_from_xy(
+            existing_stops.Longitude,
+            existing_stops.Latitude
+        )
+        existing_stops['node_id'] = ox.distance.nearest_nodes(
+            graph,
+            existing_stops.Longitude,
+            existing_stops.Latitude
+        )
+
+    # Get all graph nodes
+    nodes = ox.graph_to_gdfs(graph, nodes=True, edges=False)
+
+    # Filter out nodes used by existing stops
+    candidate_nodes = nodes[~nodes.index.isin(existing_stops['node_id'])]
+
+    # Create candidates from remaining nodes
+    candidates = candidate_nodes.sample(frac=0.3).reset_index()[['y', 'x']]
+    candidates.columns = ['Latitude', 'Longitude']
+
     return candidates
 
 
-# 4. Enhanced Candidate Generation
-def generate_candidates(df, place_center, search_radius_km=5):
-    """Generate potential bus stop locations considering existing density"""
-    # Create grid covering the search area
-    lat_range = search_radius_km / 111
-    lon_range = search_radius_km / (111 * np.cos(np.radians(place_center[0])))
+# 5. Vectorized Graph Data Preparation
+def prepare_graph_data(graph, combined):
+    """Add node degree as additional feature"""
+    # Calculate node degrees
+    degrees = pd.Series(dict(graph.degree())).rename('degree')
 
-    return pd.DataFrame([
-        (lat, lon)
-        for lat in np.linspace(place_center[0] - lat_range, place_center[0] + lat_range, 50)
-        for lon in np.linspace(place_center[1] - lon_range, place_center[1] + lon_range, 50)
-    ], columns=['Latitude', 'Longitude'])
+    # Create feature matrix
+    node_features = combined.groupby('node_id').agg({
+        'Normalized_Density': 'mean',
+        'POI_Count': 'mean'
+    })
 
-
-# 5. Graph Data Preparation with Dual Features
-def prepare_graph_data(graph, nodes, candidates):
-    """Create graph data structure with proper node ID handling"""
-    # Step 1: Add node_id column with error handling
-    try:
-        # Verify coordinate columns exist
-        if not {'Latitude', 'Longitude'}.issubset(candidates.columns):
-            raise KeyError("Missing Latitude/Longitude columns in candidates DataFrame")
-
-        # Snap candidates to road network with progress indication
-        print("Snapping candidates to road network...")
-        candidates['node_id'] = candidates.progress_apply(
-            lambda r: ox.distance.nearest_nodes(
-                graph,
-                X=r['Longitude'],  # Explicit column access
-                Y=r['Latitude']
-            ),
-            axis=1
-        )
-    except Exception as e:
-        print(f"Error creating node_id: {e}")
-        raise
-
-    # Step 2: Handle nodes not found in the graph
-    print(f"Original candidates: {len(candidates)}")
-    candidates = candidates.dropna(subset=['node_id']).copy()
-    print(f"Candidates after node matching: {len(candidates)}")
-
-    # Step 3: Create unified node index
-    all_node_ids = set(graph.nodes()).union(set(candidates['node_id']))
-    node_id_map = {orig: idx for idx, orig in enumerate(sorted(all_node_ids))}
-
-    # Step 4: Create filtered edge list
-    edge_list = [
-        (node_id_map[u], node_id_map[v])
-        for u, v in graph.edges()
-        if u in node_id_map and v in node_id_map
-    ]
-
-    # Step 5: Create node features matrix
-    node_features = pd.DataFrame(index=sorted(all_node_ids))
-    node_features['density'] = 0.0
-    node_features['poi'] = 0.0
-
-    # Aggregate candidate features
-    agg_features = candidates.groupby('node_id')[['Normalized_Density', 'POI_Count']].mean()
-    node_features.update(agg_features)
+    # Add degree feature
+    node_features = node_features.join(degrees).fillna(0)
 
     # Normalize features
-    node_features.fillna(0, inplace=True)
-    node_features = MinMaxScaler().fit_transform(node_features)
+    scaler = MinMaxScaler()
+    node_features = scaler.fit_transform(node_features)
 
-    # Convert to tensors
-    return (
-        Data(x=torch.tensor(node_features, dtype=torch.float32),
-             edge_index=torch.tensor(edge_list, dtype=torch.long).t().contiguous()),
-        candidates,
-        node_id_map
-    )
+    # Create edge index
+    edge_index = torch.tensor(
+        [(list(graph.nodes()).index(u), list(graph.nodes()).index(v))
+         for u, v in graph.edges()],
+        dtype=torch.long
+    ).t().contiguous()
+
+    return Data(
+        x=torch.tensor(node_features, dtype=torch.float32),
+        edge_index=edge_index
+    ), combined
 
 
-# 6. Enhanced GNN Model
+# 6. Enhanced GNN Model with Regularization
 class BusStopPredictor(torch.nn.Module):
-    def __init__(self, input_dim=2, hidden_dim=32, output_dim=1):
+    def __init__(self, input_dim=2, hidden_dim=256, output_dim=1):
         super().__init__()
         self.conv1 = GCNConv(input_dim, hidden_dim)
         self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.predictor = torch.nn.Linear(hidden_dim, output_dim)
+        self.conv3 = GCNConv(hidden_dim, hidden_dim//2)
+        self.dropout = torch.nn.Dropout(0.3)
+        self.predictor = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim//2, 32),
+            torch.nn.ReLU(),
+            torch.nn.Linear(32, output_dim)
+        )
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
         x = torch.relu(self.conv1(x, edge_index))
+        x = self.dropout(x)
         x = torch.relu(self.conv2(x, edge_index))
+        x = self.dropout(x)
+        x = torch.relu(self.conv3(x, edge_index))
         return torch.sigmoid(self.predictor(x))
 
 
-# 7. Model Training with Combined Features
-def train_model(data, epochs=200):
+# 7. Optimized Training Loop with Early Stopping
+def train_model(data, epochs=500, patience=20):
     model = BusStopPredictor()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5)
 
-    # Create synthetic targets based on feature combination
-    target_weights = data.x[:, 0] * 0.7 + data.x[:, 1] * 0.3  # Density 70%, POI 30%
+    target_weights = data.x[:, 0] * 0.6 + data.x[:, 1] * 0.4  # Adjusted weights
+
+    best_loss = float('inf')
+    no_improve = 0
 
     for epoch in range(epochs):
         model.train()
@@ -184,74 +203,79 @@ def train_model(data, epochs=200):
         loss = torch.mean((pred - target_weights) ** 2)
         loss.backward()
         optimizer.step()
+        scheduler.step(loss)
 
-        if epoch % 20 == 0:
-            print(f"Epoch {epoch}: Loss {loss.item():.4f}")
+        if loss < best_loss:
+            best_loss = loss
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        if no_improve >= patience:
+            print(f"Early stopping at epoch {epoch} with loss {loss:.4f}")
+            break
 
     return model
 
 
-# 8. Prediction and Post-Processing
-def predict_and_adjust(model, data, graph, candidates, node_id_map):
-    """Generate predictions with proper index mapping"""
+# 8. Optimized Prediction Handling
+def predict_and_adjust(model, data, graph, candidates):
+    """Proper prediction alignment with candidate nodes"""
     model.eval()
     with torch.no_grad():
         predictions = model(data).squeeze().numpy()
 
-    # Map predictions using node_id_map
+    # Get the full node list from graph data preparation
+    all_nodes = list(graph.nodes())
+
+    # Map predictions to candidates using node_id
     candidates['pred_prob'] = candidates['node_id'].apply(
-        lambda x: predictions[node_id_map[x]] if x in node_id_map else 0.0
+        lambda nid: predictions[all_nodes.index(nid)] if nid in all_nodes else 0.0
     )
 
-    # Filter candidates based on predicted probability
-    final_stops = candidates[candidates['pred_prob'] > 0.5].copy()
+    # Filter and adjust
+    final_stops = candidates[candidates['pred_prob'] > 0.5]
 
-    # Check if final_stops is empty
     if final_stops.empty:
-        print("No candidates met the probability threshold. Adjusting to use the top candidate...")
-        # Select the top candidate based on prediction probability
-        top_candidate_idx = candidates['pred_prob'].idxmax()
-        final_stops = candidates.loc[[top_candidate_idx]].copy()
-
-    # Snap to nearest road nodes (vectorized approach)
-    final_stops['adjusted_node'] = ox.distance.nearest_nodes(
-        graph, X=final_stops['Longitude'].values, Y=final_stops['Latitude'].values
-    )
+        final_stops = candidates.nlargest(1, 'pred_prob')
 
     return final_stops
 
 
 # Main Workflow
 def main():
-    # Load and prepare data
+    # Load data
     bus_stops = load_data("Training Data/final_busStop_density.ods")
-    graph, nodes, pois = get_osm_data()
 
-    # Generate and enhance candidates
-    candidates = generate_candidates(bus_stops, (49.8988, 10.9028))
-    candidates = calculate_poi_density(candidates, pois)
+    # Get OSM data
+    graph, _, pois = get_osm_data()
 
-    # Merge existing bus stops with candidates
+    # Generate candidates with proper node ID handling
+    candidates = generate_candidates(graph, bus_stops)
+    candidates = calculate_poi_density_parallel(candidates, pois)
+
+    # Prepare graph data (now includes existing stops)
     combined = pd.concat([bus_stops, candidates], ignore_index=True)
+    graph_data, combined = prepare_graph_data(graph, combined)
 
-    # Prepare graph data
-    graph_data, combined, node_id_map = prepare_graph_data(graph, nodes, combined)
-
-    # Train and predict
+    # Train model
     model = train_model(graph_data)
-    predictions = predict_and_adjust(model, graph_data, graph, combined, node_id_map)
 
-    # Visualize results
+    # Predict and visualize
+    predictions = predict_and_adjust(model, graph_data, graph, combined)
+
+    # Create optimized visualization
     m = folium.Map(location=[49.8988, 10.9028], zoom_start=14)
     for _, stop in predictions.iterrows():
         folium.CircleMarker(
             location=[stop.Latitude, stop.Longitude],
-            radius=5,
-            color='green' if stop.pred_prob > 0.7 else 'orange',
+            radius=6,
+            color='#ff0000' if stop.pred_prob > 0.7 else '#ffa500',
             fill=True,
-            popup=f"Prob: {stop.pred_prob:.2f}<br>POIs: {stop.POI_Count}"
+            opacity=0.7,
+            popup=f"Score: {stop.pred_prob:.2f}"
         ).add_to(m)
-    m.save("bus_stop_predictions.html")
+    m.save("optimized_predictions.html")
 
 
 if __name__ == "__main__":
