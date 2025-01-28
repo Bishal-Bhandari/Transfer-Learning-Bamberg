@@ -19,7 +19,6 @@ tqdm.pandas()
 
 # 1. Optimized Data Loading
 def load_data(file_path):
-    """Load data with optimized dtype handling"""
     df = pd.read_excel(file_path, engine='odf',
                        dtype={'Latitude': np.float32, 'Longitude': np.float32})
     scaler = MinMaxScaler()
@@ -29,7 +28,6 @@ def load_data(file_path):
 
 # 2. Enhanced OSM Data Integration with Caching
 def get_osm_data(place_name="Bamberg, Germany"):
-    """Retrieve OSM data with efficient geometry handling"""
     # Get road network with simplified graph
     graph = ox.graph_from_place(place_name, network_type='drive', simplify=True)
     nodes = ox.graph_to_gdfs(graph, nodes=True, edges=False)
@@ -60,7 +58,6 @@ def get_osm_data(place_name="Bamberg, Germany"):
 
 # 3. Parallel POI Density Calculation
 def calculate_poi_density_parallel(candidates, pois, radius=500, n_jobs=-1):
-    """Parallel POI density calculation with UTM projection"""
     if pois.empty:
         candidates['POI_Count'] = 0
         return candidates
@@ -102,7 +99,6 @@ def calculate_poi_density_parallel(candidates, pois, radius=500, n_jobs=-1):
 
 # 4. Optimized Candidate Generation using Road Network
 def generate_candidates(graph, existing_stops, search_radius_km=5):
-    """Generate candidates based on road network nodes with proper node ID handling"""
     # Convert existing stops to nodes
     if 'node_id' not in existing_stops.columns:
         # Add node_id to existing stops if missing
@@ -131,7 +127,6 @@ def generate_candidates(graph, existing_stops, search_radius_km=5):
 
 # 5. Vectorized Graph Data Preparation
 def prepare_graph_data(graph, combined):
-    """Ensure consistent node indexing across all components"""
     # Get unique node IDs from combined data
     unique_nodes = combined['node_id'].unique().tolist()
 
@@ -191,7 +186,7 @@ class BusStopPredictor(torch.nn.Module):
 
 
 # 7. Optimized Training Loop with Early Stopping
-def train_model(data, epochs=500, patience=20):
+def train_model(data, epochs=500, patience=100):
     model = BusStopPredictor()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5)
@@ -209,7 +204,7 @@ def train_model(data, epochs=500, patience=20):
         loss.backward()
         optimizer.step()
         scheduler.step(loss)
-
+        print(f"Epoch {epoch + 1} with Loss {loss:.4f}")
         if loss < best_loss:
             best_loss = loss
             no_improve = 0
@@ -217,7 +212,7 @@ def train_model(data, epochs=500, patience=20):
             no_improve += 1
 
         if no_improve >= patience:
-            print(f"Early stopping at epoch {epoch} with loss {loss:.4f}")
+            print(f"Early stopping at epoch {epoch + 1} with loss {loss:.4f}")
             break
 
     return model
