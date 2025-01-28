@@ -7,6 +7,9 @@ from sklearn.preprocessing import MinMaxScaler
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
 from scipy.spatial import cKDTree
+from tqdm import tqdm
+
+tqdm.pandas()
 
 
 # 1. Data Loading with Enhanced Features
@@ -40,13 +43,27 @@ def get_osm_data(place_name="Bamberg, Germany"):
 
 # 3. Feature Engineering with POI Density
 def calculate_poi_density(candidates, pois, radius=500):
-    """Calculate POI density around candidate points"""
+    """Calculate POI density around candidate points with proper geometry handling"""
     # Convert radius to approximate degrees
     radius_deg = radius / 111139
 
-    # Get POI coordinates
-    poi_coords = np.array([[point.y, point.x] for geom in pois.geometry
-                           for point in (geom if geom.type == 'MultiPoint' else [geom])])
+    # Extract coordinates from all geometry types
+    poi_coords = []
+    for geom in pois.geometry:
+        if geom.geom_type == 'Point':
+            poi_coords.append((geom.y, geom.x))
+        elif geom.geom_type in ['MultiPoint', 'LineString', 'MultiLineString']:
+            for point in geom.geoms:
+                if hasattr(point, 'coords'):
+                    poi_coords.append((point.y, point.x))
+        elif geom.geom_type in ['Polygon', 'MultiPolygon']:
+            # Use centroid for area features
+            centroid = geom.centroid
+            poi_coords.append((centroid.y, centroid.x))
+
+    if not poi_coords:  # Handle case with no POIs
+        candidates['POI_Count'] = 0
+        return candidates
 
     # Create spatial index
     tree = cKDTree(poi_coords)
@@ -78,39 +95,62 @@ def generate_candidates(df, place_center, search_radius_km=5):
 
 # 5. Graph Data Preparation with Dual Features
 def prepare_graph_data(graph, nodes, candidates):
-    """Create graph data structure with density and POI features"""
-    # Snap candidates to road network
-    candidates['node_id'] = candidates.apply(
-        lambda r: ox.distance.nearest_nodes(graph, r.Longitude, r.Latitude),
-        axis=1
-    )
+    """Create graph data structure with proper node ID handling"""
+    # Step 1: Add node_id column with error handling
+    try:
+        # Verify coordinate columns exist
+        if not {'Latitude', 'Longitude'}.issubset(candidates.columns):
+            raise KeyError("Missing Latitude/Longitude columns in candidates DataFrame")
 
-    # Aggregate features per road node
-    node_features = nodes[['x', 'y']].copy()
+        # Snap candidates to road network with progress indication
+        print("Snapping candidates to road network...")
+        candidates['node_id'] = candidates.progress_apply(
+            lambda r: ox.distance.nearest_nodes(
+                graph,
+                X=r['Longitude'],  # Explicit column access
+                Y=r['Latitude']
+            ),
+            axis=1
+        )
+    except Exception as e:
+        print(f"Error creating node_id: {e}")
+        raise
+
+    # Step 2: Handle nodes not found in the graph
+    print(f"Original candidates: {len(candidates)}")
+    candidates = candidates.dropna(subset=['node_id']).copy()
+    print(f"Candidates after node matching: {len(candidates)}")
+
+    # Step 3: Create unified node index
+    all_node_ids = set(graph.nodes()).union(set(candidates['node_id']))
+    node_id_map = {orig: idx for idx, orig in enumerate(sorted(all_node_ids))}
+
+    # Step 4: Create filtered edge list
+    edge_list = [
+        (node_id_map[u], node_id_map[v])
+        for u, v in graph.edges()
+        if u in node_id_map and v in node_id_map
+    ]
+
+    # Step 5: Create node features matrix
+    node_features = pd.DataFrame(index=sorted(all_node_ids))
     node_features['density'] = 0.0
     node_features['poi'] = 0.0
 
-    # Calculate mean features for nodes with multiple candidates
+    # Aggregate candidate features
     agg_features = candidates.groupby('node_id')[['Normalized_Density', 'POI_Count']].mean()
-
-    for node_id, features in agg_features.iterrows():
-        if node_id in node_features.index:
-            node_features.at[node_id, 'density'] = features['Normalized_Density']
-            node_features.at[node_id, 'poi'] = features['POI_Count']
+    node_features.update(agg_features)
 
     # Normalize features
-    scaler = MinMaxScaler()
-    node_features[['density', 'poi']] = scaler.fit_transform(node_features[['density', 'poi']])
+    node_features.fillna(0, inplace=True)
+    node_features = MinMaxScaler().fit_transform(node_features)
 
-    # Create edge index
-    edge_index = torch.tensor(
-        [(u, v) for u, v in graph.edges() if u in node_features.index and v in node_features.index],
-        dtype=torch.long
-    ).t().contiguous()
-
-    return Data(
-        x=torch.tensor(node_features[['density', 'poi']].values, dtype=torch.float),
-        edge_index=edge_index
+    # Convert to tensors
+    return (
+        Data(x=torch.tensor(node_features, dtype=torch.float32),
+             edge_index=torch.tensor(edge_list, dtype=torch.long).t().contiguous()),
+        candidates,
+        node_id_map
     )
 
 
@@ -152,20 +192,30 @@ def train_model(data, epochs=200):
 
 
 # 8. Prediction and Post-Processing
-def predict_and_adjust(model, data, graph, candidates):
-    """Generate predictions and snap to road network"""
+def predict_and_adjust(model, data, graph, candidates, node_id_map):
+    """Generate predictions with proper index mapping"""
     model.eval()
     with torch.no_grad():
         predictions = model(data).squeeze().numpy()
 
-    # Assign predictions to candidates
-    candidates['pred_prob'] = predictions[candidates['node_id'].apply(lambda x: list(data.x[:, 0]).index(x))]
+    # Map predictions using node_id_map
+    candidates['pred_prob'] = candidates['node_id'].apply(
+        lambda x: predictions[node_id_map[x]] if x in node_id_map else 0.0
+    )
 
-    # Filter and adjust to road network
-    final_stops = candidates[candidates['pred_prob'] > 0.5]
-    final_stops['adjusted_coords'] = final_stops.apply(
-        lambda r: ox.distance.nearest_nodes(graph, r.Longitude, r.Latitude),
-        axis=1
+    # Filter candidates based on predicted probability
+    final_stops = candidates[candidates['pred_prob'] > 0.5].copy()
+
+    # Check if final_stops is empty
+    if final_stops.empty:
+        print("No candidates met the probability threshold. Adjusting to use the top candidate...")
+        # Select the top candidate based on prediction probability
+        top_candidate_idx = candidates['pred_prob'].idxmax()
+        final_stops = candidates.loc[[top_candidate_idx]].copy()
+
+    # Snap to nearest road nodes (vectorized approach)
+    final_stops['adjusted_node'] = ox.distance.nearest_nodes(
+        graph, X=final_stops['Longitude'].values, Y=final_stops['Latitude'].values
     )
 
     return final_stops
@@ -175,7 +225,7 @@ def predict_and_adjust(model, data, graph, candidates):
 def main():
     # Load and prepare data
     bus_stops = load_data("Training Data/final_busStop_density.ods")
-    graph, pois = get_osm_data()
+    graph, nodes, pois = get_osm_data()
 
     # Generate and enhance candidates
     candidates = generate_candidates(bus_stops, (49.8988, 10.9028))
@@ -185,11 +235,11 @@ def main():
     combined = pd.concat([bus_stops, candidates], ignore_index=True)
 
     # Prepare graph data
-    graph_data = prepare_graph_data(graph, combined)
+    graph_data, combined, node_id_map = prepare_graph_data(graph, nodes, combined)
 
     # Train and predict
     model = train_model(graph_data)
-    predictions = predict_and_adjust(model, graph_data, graph, candidates)
+    predictions = predict_and_adjust(model, graph_data, graph, combined, node_id_map)
 
     # Visualize results
     m = folium.Map(location=[49.8988, 10.9028], zoom_start=14)
