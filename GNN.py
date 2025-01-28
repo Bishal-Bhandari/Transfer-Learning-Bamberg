@@ -5,7 +5,6 @@ import torch
 from sklearn.preprocessing import MinMaxScaler
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
-from sklearn.metrics import mean_absolute_error
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -18,42 +17,66 @@ def load_data(file_path):
     return df
 
 
-# Load OSM Data
+# Load OSM Data and POIs
 def get_osm_data():
-    graph = ox.graph_from_place("Bamberg, Germany", network_type='drive')
+    place_name = "Bamberg, Germany"
+    graph = ox.graph_from_place(place_name, network_type='drive')
     nodes, edges = ox.graph_to_gdfs(graph)
-    return graph, nodes, edges
+
+    # Get POI data
+    tags = {
+        'amenity': True,
+        'public_transport': ['station', 'stop_position'],
+        'shop': ['supermarket', 'mall'],
+        'office': True,
+        'tourism': True
+    }
+    pois = ox.features_from_place(place_name, tags)
+    return graph, nodes, edges, pois
 
 
 # Generate Candidate Locations
 def generate_candidate_locations(df, center_lat, center_lon, radius_km, high_density_threshold=0.7, base_points=10):
-    # Convert radius to degrees
     lat_radius = radius_km / 111
     lon_radius = radius_km / (111 * np.cos(np.radians(center_lat)))
 
-    # Split the data into high-density and low-density
     high_density = df[df['Normalized_Density'] >= high_density_threshold]
     low_density = df[df['Normalized_Density'] < high_density_threshold]
 
-    # Generate candidates for high-density areas
     high_density_candidates = pd.DataFrame([
         (lat, lon) for lat in np.linspace(center_lat - lat_radius, center_lat + lat_radius, base_points * 2)
         for lon in np.linspace(center_lon - lon_radius, center_lon + lon_radius, base_points * 2)
     ], columns=["Latitude", "Longitude"])
 
-    # Ensure at least one candidate for each low-density location
     low_density_candidates = low_density[['Latitude', 'Longitude']].drop_duplicates()
-
-    # Combine high- and low-density candidates
     all_candidates = pd.concat([high_density_candidates, low_density_candidates], ignore_index=True)
     return all_candidates
 
 
-# Assign Density to Candidates
-def assign_density_to_candidates(candidates, df):
+# Assign Density and POI counts to Candidates
+def assign_features_to_candidates(candidates, df, pois):
+    # Assign density
     density_tree = cKDTree(df[['Latitude', 'Longitude']])
     distances, indices = density_tree.query(candidates[['Latitude', 'Longitude']], k=1)
     candidates['Density'] = df.iloc[indices]['Normalized_Density'].values
+
+    # Assign POI counts
+    def get_poi_coords(pois_gdf):
+        return np.array([(geom.y, geom.x) for geom in pois_gdf.geometry if geom.geom_type == 'Point'])
+
+    poi_coords = get_poi_coords(pois)
+    if len(poi_coords) > 0:
+        poi_tree = cKDTree(poi_coords)
+        radius_deg = 500 / 111000  # ~500 meters
+        poi_counts = poi_tree.query_ball_point(candidates[['Latitude', 'Longitude']].values, r=radius_deg,
+                                               return_length=True)
+        candidates['POI_Count'] = poi_counts
+    else:
+        candidates['POI_Count'] = 0
+
+    # Normalize POI counts
+    scaler = MinMaxScaler()
+    candidates['POI_Normalized'] = scaler.fit_transform(candidates[['POI_Count']])
     return candidates
 
 
@@ -66,20 +89,22 @@ def prepare_graph_data_with_candidates(df, graph, nodes, candidates):
     combined_df['Node_ID'] = combined_df['Node_ID'].astype(int)
 
     node_features = pd.DataFrame(index=nodes.index)
-    node_features['Density'] = 0
-    node_features.loc[combined_df['Node_ID'], 'Density'] = combined_df['Density'].astype(int).values
+    node_features['Density'] = 0.0
+    node_features['POI_Normalized'] = 0.0
+
+    for _, row in combined_df.iterrows():
+        node_id = row['Node_ID']
+        if node_id in node_features.index:
+            node_features.at[node_id, 'Density'] = row['Density']
+            node_features.at[node_id, 'POI_Normalized'] = row['POI_Normalized']
 
     valid_indices = list(node_features.index)
     filtered_edges = [(u, v) for u, v, *_ in graph.edges if u in valid_indices and v in valid_indices]
-
     node_id_map = {old_id: new_id for new_id, old_id in enumerate(valid_indices)}
     reindexed_edges = [(node_id_map[u], node_id_map[v]) for u, v in filtered_edges]
 
     edge_index = torch.tensor(reindexed_edges, dtype=torch.long).t().contiguous()
-    x = torch.tensor(node_features['Density'].fillna(0).values, dtype=torch.float).view(-1, 1)
-
-    if edge_index.numel() > 0 and edge_index.max() >= x.size(0):
-        raise ValueError(f"Edge indices exceed node features size: max index {edge_index.max()}, node size {x.size(0)}")
+    x = torch.tensor(node_features[['Density', 'POI_Normalized']].values, dtype=torch.float)
 
     data = Data(x=x, edge_index=edge_index)
     return data, combined_df
@@ -87,152 +112,105 @@ def prepare_graph_data_with_candidates(df, graph, nodes, candidates):
 
 # Define GNN Model
 class GCN(torch.nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+    def __init__(self, input_dim=2, hidden_dim=16, output_dim=1, num_layers=3):
         super(GCN, self).__init__()
-
-        # Number of layers can be adjusted
-        self.num_layers = num_layers
         self.convs = torch.nn.ModuleList()
-
-        # Input layer
         self.convs.append(GCNConv(input_dim, hidden_dim))
-
-        # Hidden layers
-        for _ in range(num_layers - 2):  # For intermediate layers (excluding input/output)
+        for _ in range(num_layers - 2):
             self.convs.append(GCNConv(hidden_dim, hidden_dim))
-
-        # Output layer
         self.convs.append(GCNConv(hidden_dim, output_dim))
-
-        # Dropout for regularization
-        self.dropout = torch.nn.Dropout(p=0.5)
+        self.dropout = torch.nn.Dropout(p=0.3)
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
-
-        # Apply each layer with ReLU activation and dropout
-        for i in range(self.num_layers - 1):  # Exclude the last layer for output
+        for i in range(len(self.convs) - 1):
             x = self.convs[i](x, edge_index)
             x = torch.relu(x)
-            x = self.dropout(x)  # Apply dropout after each layer
-
-        # Output layer (no ReLU or dropout here)
+            x = self.dropout(x)
         x = self.convs[-1](x, edge_index)
-        return torch.sigmoid(x)  # Sigmoid activation for binary classification or regression
+        return torch.sigmoid(x)
 
 
 # Train GNN
 def train_gnn(data, df, epochs=500, lr=0.01):
-    # Example usage
-    model = GCN(input_dim=1, hidden_dim=16, output_dim=1, num_layers=5)  # 5 layers in total
-
+    model = GCN(input_dim=2)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    # Create composite target from features
+    composite_target = data.x[:, 0] + data.x[:, 1]  # Density + POI
 
     model.train()
     for epoch in range(epochs):
         optimizer.zero_grad()
-        out = model(data)
+        out = model(data).squeeze()
 
-        # Custom loss: Higher weight for high-density areas, minimum weight for low-density areas
-        weights = data.x.squeeze()
-        min_weight = 0.1  # Ensure low-density areas have non-zero weight
-        adjusted_weights = torch.where(weights > 0, weights + min_weight, torch.tensor(min_weight))
+        # Weight by composite importance
+        weights = composite_target + 0.1  # Ensure low-weight areas contribute
+        loss = (weights * (out - composite_target) ** 2).mean()
 
-        # Weighted MSE loss
-        loss = ((adjusted_weights * (out.squeeze() - data.x.squeeze()) ** 2).mean())
         loss.backward()
         optimizer.step()
-
         print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item():.4f}")
-
     return model
 
 
 # Predict Candidates
-def predict_candidates(model, data, candidates, low_density_threshold=0.7):
+def predict_candidates(model, data, candidates):
     model.eval()
     with torch.no_grad():
         predictions = model(data).squeeze().numpy()
         candidates['Prediction'] = predictions[-len(candidates):]
         candidates['Predicted_Stop'] = (candidates['Prediction'] > 0.5).astype(int)
-
-        # Ensure at least one bus stop in low-density areas
-        low_density_candidates = candidates[candidates['Density'] < low_density_threshold]
-        if low_density_candidates['Predicted_Stop'].sum() == 0:
-            # Select the candidate with the highest prediction in low-density areas
-            idx = low_density_candidates['Prediction'].idxmax()
-            candidates.loc[idx, 'Predicted_Stop'] = 1
-
     return candidates
 
 
 # Adjust predictions to nearest road nodes
 def adjust_predictions_to_road(candidates, graph):
-    # Snap each candidate to the nearest node on the road network
     candidates['Adjusted_Node_ID'] = candidates.apply(
-        lambda row: ox.distance.nearest_nodes(graph, X=row['Longitude'], Y=row['Latitude']), axis=1
+        lambda row: ox.distance.nearest_nodes(graph, row['Longitude'], row['Latitude']), axis=1
     )
-
-    # Map the snapped node IDs back to their coordinates in the graph
     candidates['Adjusted_Latitude'] = candidates['Adjusted_Node_ID'].map(
         lambda node_id: graph.nodes[node_id]['y'] if node_id in graph.nodes else np.nan
     )
     candidates['Adjusted_Longitude'] = candidates['Adjusted_Node_ID'].map(
         lambda node_id: graph.nodes[node_id]['x'] if node_id in graph.nodes else np.nan
     )
-
-    # Drop candidates where snapping failed (e.g., outside the graph area)
-    candidates = candidates.dropna(subset=['Adjusted_Latitude', 'Adjusted_Longitude']).reset_index(drop=True)
-    return candidates
+    return candidates.dropna(subset=['Adjusted_Latitude', 'Adjusted_Longitude'])
 
 
-# Visualize Results (Updated for Adjusted Points)
+# Visualize Results
 def visualize_candidate_predictions(candidates, output_html):
     map_bamberg = folium.Map(location=[49.8988, 10.9028], zoom_start=13)
     for _, row in candidates.iterrows():
-        color = 'blue' if row['Density'] >= 0.7 else 'red'
-        folium.Marker(
+        color = 'green' if row['Predicted_Stop'] else 'gray'
+        folium.CircleMarker(
             location=[row['Adjusted_Latitude'], row['Adjusted_Longitude']],
-            popup=f"Adjusted Location - Prediction: {row['Prediction']:.2f}, Density: {row['Density']:.2f}",
-            icon=folium.Icon(color=color, icon='ok-sign')
+            radius=3,
+            color=color,
+            fill=True,
+            fill_color=color,
+            popup=f"Density: {row['Density']:.2f}, POI: {row['POI_Count']}"
         ).add_to(map_bamberg)
     map_bamberg.save(output_html)
 
 
-# Main Function (Updated Integration)
+# Main Function
 def main():
     input_file = "Training Data/final_busStop_density.ods"
     output_file = "Model Data/GNN-predicted_candidates.ods"
     output_html = "Template/GNN-candidate_predictions.html"
 
-    # Load the density data
     df = load_data(input_file)
-
-    # Load the road network graph
-    graph, nodes, _ = get_osm_data()
-
-    # Generate candidates based on density
-    candidates = generate_candidate_locations(df, 49.8988, 10.9028, 5, high_density_threshold=0.7, base_points=10)
-
-    # Assign density to the generated candidates
-    candidates = assign_density_to_candidates(candidates, df)
-
-    # Prepare graph data with candidates
+    graph, nodes, edges, pois = get_osm_data()
+    candidates = generate_candidate_locations(df, 49.8988, 10.9028, 5)
+    candidates = assign_features_to_candidates(candidates, df, pois)
     data, combined_df = prepare_graph_data_with_candidates(df, graph, nodes, candidates)
-
-    # Train the GNN model
     model = train_gnn(data, df)
-
-    # Predict probabilities for candidates
     candidates = predict_candidates(model, data, candidates)
-
-    # Snap predicted locations to the road network
     candidates = adjust_predictions_to_road(candidates, graph)
-
-    # Save and visualize results
     candidates.to_excel(output_file, engine='odf')
     visualize_candidate_predictions(candidates, output_html)
-    print(f"Done")
+    print("Processing complete")
 
 
 if __name__ == "__main__":
