@@ -131,34 +131,39 @@ def generate_candidates(graph, existing_stops, search_radius_km=5):
 
 # 5. Vectorized Graph Data Preparation
 def prepare_graph_data(graph, combined):
-    """Add node degree as additional feature"""
-    # Calculate node degrees
-    degrees = pd.Series(dict(graph.degree())).rename('degree')
+    """Ensure consistent node indexing across all components"""
+    # Get unique node IDs from combined data
+    unique_nodes = combined['node_id'].unique().tolist()
 
-    # Create feature matrix
+    # Create bidirectional mapping
+    node_id_to_idx = {nid: idx for idx, nid in enumerate(unique_nodes)}
+    idx_to_node_id = {idx: nid for idx, nid in enumerate(unique_nodes)}
+
+    # Filter edges to only include nodes in our dataset
+    edge_list = []
+    for u, v in graph.edges():
+        if u in node_id_to_idx and v in node_id_to_idx:
+            edge_list.append([node_id_to_idx[u], node_id_to_idx[v]])
+
+    # Create feature matrix in correct order
     node_features = combined.groupby('node_id').agg({
         'Normalized_Density': 'mean',
         'POI_Count': 'mean'
-    })
-
-    # Add degree feature
-    node_features = node_features.join(degrees).fillna(0)
+    }).reindex(unique_nodes).fillna(0)
 
     # Normalize features
     scaler = MinMaxScaler()
     node_features = scaler.fit_transform(node_features)
 
-    # Create edge index
-    edge_index = torch.tensor(
-        [(list(graph.nodes()).index(u), list(graph.nodes()).index(v))
-         for u, v in graph.edges()],
-        dtype=torch.long
-    ).t().contiguous()
-
-    return Data(
-        x=torch.tensor(node_features, dtype=torch.float32),
-        edge_index=edge_index
-    ), combined
+    return (
+        Data(
+            x=torch.tensor(node_features, dtype=torch.float32),
+            edge_index=torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+        ),
+        combined,
+        node_id_to_idx,
+        idx_to_node_id
+    )
 
 
 # 6. Enhanced GNN Model with Regularization
@@ -219,22 +224,19 @@ def train_model(data, epochs=500, patience=20):
 
 
 # 8. Optimized Prediction Handling
-def predict_and_adjust(model, data, graph, candidates):
-    """Proper prediction alignment with candidate nodes"""
+def predict_and_adjust(model, data, graph, candidates, node_id_to_idx):
+    """Safe prediction mapping with index validation"""
     model.eval()
     with torch.no_grad():
         predictions = model(data).squeeze().numpy()
 
-    # Get the full node list from graph data preparation
-    all_nodes = list(graph.nodes())
-
-    # Map predictions to candidates using node_id
-    candidates['pred_prob'] = candidates['node_id'].apply(
-        lambda nid: predictions[all_nodes.index(nid)] if nid in all_nodes else 0.0
+    # Vectorized mapping using dictionary lookup
+    candidates['pred_prob'] = candidates['node_id'].map(
+        lambda nid: predictions[node_id_to_idx[nid]] if nid in node_id_to_idx else 0.0
     )
 
-    # Filter and adjust
-    final_stops = candidates[candidates['pred_prob'] > 0.5]
+    # Handle missing predictions safely
+    final_stops = candidates[candidates['pred_prob'].notna() & (candidates['pred_prob'] > 0.5)]
 
     if final_stops.empty:
         final_stops = candidates.nlargest(1, 'pred_prob')
@@ -250,19 +252,19 @@ def main():
     # Get OSM data
     graph, _, pois = get_osm_data()
 
-    # Generate candidates with proper node ID handling
+    # Generate candidates
     candidates = generate_candidates(graph, bus_stops)
     candidates = calculate_poi_density_parallel(candidates, pois)
 
-    # Prepare graph data (now includes existing stops)
+    # Combine and prepare graph data
     combined = pd.concat([bus_stops, candidates], ignore_index=True)
-    graph_data, combined = prepare_graph_data(graph, combined)
+    graph_data, combined, node_id_to_idx, _ = prepare_graph_data(graph, combined)
 
     # Train model
     model = train_model(graph_data)
 
-    # Predict and visualize
-    predictions = predict_and_adjust(model, graph_data, graph, combined)
+    # Predict and adjust
+    predictions = predict_and_adjust(model, graph_data, graph, combined, node_id_to_idx)
 
     # Create optimized visualization
     m = folium.Map(location=[49.8988, 10.9028], zoom_start=14)
