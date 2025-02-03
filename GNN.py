@@ -6,6 +6,7 @@ import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
+import torch.nn.functional as F
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 import geopandas as gpd
@@ -314,7 +315,7 @@ def save_predictions(predictions, output_file):
 def main():
     # Load input data
     grid_gdf = load_grid_data("Training Data/city_grid_density.ods")
-    bus_stops = load_bus_stops("Training Data/existing_stops.ods", grid_gdf)
+    bus_stops = load_bus_stops("Training Data/stib_stops.ods", grid_gdf)
 
     # Get OSM data
     graph = ox.graph_from_place("Bamberg, Germany", network_type='drive', simplify=True)
