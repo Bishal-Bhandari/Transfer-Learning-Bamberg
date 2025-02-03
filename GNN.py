@@ -313,8 +313,8 @@ def save_predictions(predictions, output_file):
 # 9. Updated Main Workflow ----------------------------------------------------
 def main():
     # Load input data
-    grid_gdf = load_grid_data("city_grid_density.ods")
-    bus_stops = load_bus_stops("existing_stops.ods", grid_gdf)
+    grid_gdf = load_grid_data("Training Data/city_grid_density.ods")
+    bus_stops = load_bus_stops("Training Data/existing_stops.ods", grid_gdf)
 
     # Get OSM data
     graph = ox.graph_from_place("Bamberg, Germany", network_type='drive', simplify=True)
