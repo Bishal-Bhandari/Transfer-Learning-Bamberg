@@ -6,116 +6,435 @@ import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
+import torch.nn.functional as F
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 import geopandas as gpd
 from joblib import Parallel, delayed
-from shapely.geometry import Polygon, MultiPolygon
+from shapely.geometry import Polygon, Point, MultiPolygon
+import pyexcel as pe
 
+ox.settings.log_console = True
+ox.settings.use_cache = True
 tqdm.pandas()
 
-def load_grid_data(file_path):
-    df = pd.read_excel(file_path, engine='odf',
-                       dtype={'Latitude': np.float32, 'Longitude': np.float32, 'Density': np.int32})
-    scaler = MinMaxScaler()
-    df['Normalized_Density'] = scaler.fit_transform(df[['Density']]).astype(np.float32)
-    return df
 
-def get_osm_data(place_name="Bamberg, Germany"):
-    graph = ox.graph_from_place(place_name, network_type='drive', simplify=True)
+# 1. Load Grid Data
+def load_grid_data(grid_file):
+    grid_df = pd.read_excel(grid_file, engine='odf',
+                            dtype={'min_lat': np.float32, 'max_lat': np.float32,
+                                   'min_lon': np.float32, 'max_lon': np.float32,
+                                   'density_rank': np.int8})
+
+    # Filter out rows with NaN values in critical columns
+    grid_df = grid_df.dropna(subset=['min_lat', 'max_lat', 'min_lon', 'max_lon', 'density_rank'])
+
+    # Create polygons
+    grid_df['geometry'] = grid_df.apply(lambda row: Polygon([
+        (row['min_lon'], row['min_lat']),
+        (row['max_lon'], row['min_lat']),
+        (row['max_lon'], row['max_lat']),
+        (row['min_lon'], row['max_lat'])
+    ]), axis=1)
+
+    return gpd.GeoDataFrame(grid_df, geometry='geometry', crs="EPSG:4326")
+
+
+# 2. Load Bus Stops
+def load_bus_stops(stop_file, grid_gdf, graph):
+    stops = pd.read_excel(stop_file, engine='odf')
+
+    # Column mapping for flexible reading
+    col_map = {'Latitude': ['Latitude', 'lat', 'stop_lat'],
+               'Longitude': ['Longitude', 'lon', 'stop_lon', 'lng']}
+
+    lat_col = next((c for c in col_map['Latitude'] if c in stops.columns), None)
+    lon_col = next((c for c in col_map['Longitude'] if c in stops.columns), None)
+
+    if not lat_col or not lon_col:
+        raise ValueError(f"Latitude/Longitude columns not found. Available columns: {stops.columns.tolist()}")
+
+    stops = stops.rename(columns={lat_col: 'Latitude', lon_col: 'Longitude'})
+
+    # Filter out rows with NaN in 'Latitude' or 'Longitude'
+    stops = stops.dropna(subset=['Latitude', 'Longitude'])
+
+    # Convert to GeoDataFrame
+    gdf = gpd.GeoDataFrame(stops, geometry=gpd.points_from_xy(stops.Longitude, stops.Latitude), crs="EPSG:4326")
+
+    # Join with grid
+    joined = gpd.sjoin(gdf, grid_gdf[['geometry', 'density_rank']], how='left', predicate='within')
+
+    # Normalize density
+    joined['density_rank'] = joined['density_rank'].fillna(1).astype(np.int8)
+    joined['Normalized_Density'] = MinMaxScaler().fit_transform(joined[['density_rank']])
+
+    # Assign nearest node
+    if joined[['Longitude', 'Latitude']].isna().any().any():
+        raise ValueError("Missing Longitude/Latitude values in bus stops data.")
+
+    joined['node_id'] = ox.distance.nearest_nodes(graph, joined['Longitude'], joined['Latitude'])
+
+    return joined.drop(columns='index_right')
+
+
+# 3. Generate Candidates
+def generate_candidates(graph, existing_stops, grid_gdf):
+    """Generate candidates with junction avoidance and enhanced density sampling"""
     nodes = ox.graph_to_gdfs(graph, nodes=True, edges=False)
-    poi_tags = {'amenity': True, 'shop': True, 'public_transport': True, 'tourism': True}
-    pois = ox.features_from_place(place_name, poi_tags)
-    pois = pois[pois.geometry.notnull()].copy()
-    pois['geometry'] = pois.geometry.apply(lambda g: g.centroid if isinstance(g, (Polygon, MultiPolygon)) else g)
-    pois = pois.explode(index_parts=True).reset_index(drop=True)
-    return graph, nodes, pois
 
-def calculate_poi_density(candidates, pois, radius=500):
-    if pois.empty:
-        candidates['POI_Count'] = 0
-        return candidates
-    tree = cKDTree(pois[['geometry'].apply(lambda g: (g.x, g.y))].tolist())
-    counts = tree.query_ball_point(candidates[['Longitude', 'Latitude']].values, r=radius, return_length=True)
-    candidates['POI_Count'] = counts
-    return candidates
+    # Calculate node degrees and filter out junctions (nodes with degree > 3)
+    degrees = pd.Series(dict(graph.degree()))
+    nodes = nodes[degrees <= 3]  # Exclude nodes with more than 3 connections
 
-def generate_candidates(graph, grid_data):
+    candidate_nodes = nodes[~nodes.index.isin(existing_stops['node_id'])]
+
+    # Create GeoDataFrame
+    candidate_gdf = gpd.GeoDataFrame(
+        candidate_nodes[['y', 'x']].reset_index(),
+        geometry=gpd.points_from_xy(candidate_nodes.x, candidate_nodes.y),
+        crs="EPSG:4326"
+    )
+
+    # Join with grid data
+    candidates = gpd.sjoin(candidate_gdf, grid_gdf[['geometry', 'density_rank']],
+                           how='left', predicate='within')
+    candidates['density_rank'] = candidates['density_rank'].fillna(1).astype(int)
+
+    # Enhanced sampling weights for density ranks
+    sample_weights = {5: 1.0, 4: 0.8, 3: 0.5, 2: 0.2, 1: 0.1}  # More aggressive sampling
+    sampled = []
+
+    for rank, weight in sample_weights.items():
+        pool = candidates[candidates['density_rank'] == rank]
+        if not pool.empty:
+            # Ensure minimum of 20% of available nodes per rank are sampled
+            min_samples = max(int(0.2 * len(pool)), 1)
+            sampled.append(pool.sample(n=min_samples + int(weight * len(pool)), replace=True))
+
+    final_candidates = pd.concat(sampled)
+    final_candidates['Normalized_Density'] = final_candidates['density_rank'] / 5.0
+
+    return final_candidates[['y', 'x', 'Normalized_Density', 'density_rank']].rename(
+        columns={'y': 'Latitude', 'x': 'Longitude'}
+    )
+
+
+# 4. Calculate POI Density
+def calculate_poi_density(points_gdf, pois_gdf, radius=500):
+    """Calculate POI density around candidate points."""
+
+    if pois_gdf.empty:
+        points_gdf['POI_Count'] = 0
+        return points_gdf
+
+    # Ensure points_gdf is a GeoDataFrame
+    if not isinstance(points_gdf, gpd.GeoDataFrame):
+        points_gdf = gpd.GeoDataFrame(
+            points_gdf,
+            geometry=gpd.points_from_xy(points_gdf.Longitude, points_gdf.Latitude),
+            crs="EPSG:4326"
+        )
+
+    # Convert polygons to centroids for POIs
+    pois_gdf['geometry'] = pois_gdf['geometry'].apply(
+        lambda geom: geom.centroid if geom.geom_type in ['Polygon', 'MultiPolygon'] else geom
+    )
+
+    # Filter valid POI points
+    pois_gdf = pois_gdf[pois_gdf.geometry.notnull() & (pois_gdf.geometry.geom_type == 'Point')]
+
+    if pois_gdf.empty:
+        points_gdf['POI_Count'] = 0
+        return points_gdf
+
+    # Convert to UTM for accurate distance calculations
+    utm_crs = points_gdf.estimate_utm_crs()
+    points_utm = points_gdf.to_crs(utm_crs)
+    pois_utm = pois_gdf.to_crs(utm_crs)
+
+    # Create spatial index
+    poi_coords = np.array([(geom.x, geom.y) for geom in pois_utm.geometry])
+    tree = cKDTree(poi_coords)
+
+    def count_pois(row):
+        return len(tree.query_ball_point([row.geometry.x, row.geometry.y], r=radius))
+
+    points_utm['POI_Count'] = Parallel(n_jobs=-1)(
+        delayed(count_pois)(row) for _, row in tqdm(points_utm.iterrows(), total=len(points_utm))
+    )
+
+    return points_gdf.merge(points_utm[['POI_Count']], left_index=True, right_index=True)
+
+
+# 5. Prepare Graph Data
+def prepare_graph_data(graph, combined_data):
+    """Create graph structure for GNN ensuring valid edges."""
+    combined_data['Density_POI_Interaction'] = (
+            combined_data['Normalized_Density'] *
+            combined_data['POI_Count']
+    )
+
+    # Extract nodes correctly
     nodes = ox.graph_to_gdfs(graph, nodes=True, edges=False)
-    grid_data['node_id'] = ox.distance.nearest_nodes(graph, grid_data.Longitude, grid_data.Latitude)
-    candidate_nodes = nodes[~nodes.index.isin(grid_data['node_id'])].sample(frac=0.3).reset_index()
-    candidates = candidate_nodes[['y', 'x']]
-    candidates.columns = ['Latitude', 'Longitude']
-    return candidates
+    valid_nodes = set(nodes.index)  # Extract valid node IDs
 
-def prepare_graph_data(graph, combined):
-    unique_nodes = combined['node_id'].unique().tolist()
+    # Ensure combined_data has 'node_id'
+    if 'node_id' not in combined_data.columns:
+        raise ValueError("Error: 'node_id' column missing in combined_data.")
+
+    features = combined_data.groupby('node_id')[
+        ['Normalized_Density', 'POI_Count', 'Density_POI_Interaction']
+    ].mean()
+
+    # Filter edges based on valid nodes
+    edge_list = [[u, v] for u, v in graph.edges() if u in valid_nodes and v in valid_nodes]
+
+    unique_nodes = sorted(valid_nodes)
     node_id_to_idx = {nid: idx for idx, nid in enumerate(unique_nodes)}
-    edge_list = [[node_id_to_idx[u], node_id_to_idx[v]] for u, v in graph.edges() if u in node_id_to_idx and v in node_id_to_idx]
-    node_features = combined.groupby('node_id').agg({'Normalized_Density': 'mean', 'POI_Count': 'mean'}).reindex(unique_nodes).fillna(0)
-    node_features = MinMaxScaler().fit_transform(node_features)
-    return Data(x=torch.tensor(node_features, dtype=torch.float32), edge_index=torch.tensor(edge_list, dtype=torch.long).t().contiguous()), combined, node_id_to_idx
 
+    # Ensure edge indices are mapped correctly
+    edge_list = [[node_id_to_idx[u], node_id_to_idx[v]] for u, v in edge_list if u in node_id_to_idx and v in node_id_to_idx]
+
+    features = features.reindex(unique_nodes).fillna(0).values  # Ensure correct ordering
+
+    data = Data(
+        x=torch.tensor(features, dtype=torch.float32),
+        edge_index=torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+    )
+
+    return data, unique_nodes
+
+
+# 6. Train Model
 class BusStopPredictor(torch.nn.Module):
-    def __init__(self, input_dim=2, hidden_dim=256, output_dim=1):
+    def __init__(self):
         super().__init__()
-        self.conv1 = GCNConv(input_dim, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.conv3 = GCNConv(hidden_dim, hidden_dim//2)
-        self.predictor = torch.nn.Sequential(torch.nn.Linear(hidden_dim//2, 32), torch.nn.ReLU(), torch.nn.Linear(32, output_dim))
+        self.conv1 = GCNConv(3, 256)  # Increased input features and hidden size
+        self.conv2 = GCNConv(256, 128)
+        self.conv3 = GCNConv(128, 64)  # Additional layer
+        self.predictor = torch.nn.Sequential(
+            torch.nn.Linear(64, 32),
+            torch.nn.ReLU(),
+            torch.nn.Linear(32, 1)
+        )
+
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
-        x = torch.relu(self.conv1(x, edge_index))
-        x = torch.relu(self.conv2(x, edge_index))
-        x = torch.relu(self.conv3(x, edge_index))
-        return torch.sigmoid(self.predictor(x))
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.relu(self.conv2(x, edge_index))
+        x = F.relu(self.conv3(x, edge_index))
+        return self.predictor(x).squeeze()
 
-def train_model(data, epochs=500, patience=100):
-    model = BusStopPredictor()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-5)
-    target_weights = data.x[:, 0] * 0.6 + data.x[:, 1] * 0.4
+
+# 6. Training & Prediction
+def train_model(model, data, epochs=500):
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-4)
+
+    # Calculate class weights and move to correct device
+    pos_weight = torch.tensor([(len(data.y) - data.y.sum()) / data.y.sum()]).to(data.x.device)
+
+    # Use BCEWithLogitsLoss instead of BCELoss
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10)
+
     best_loss = float('inf')
-    no_improve = 0
     for epoch in range(epochs):
         model.train()
         optimizer.zero_grad()
-        pred = model(data).squeeze()
-        loss = torch.mean((pred - target_weights) ** 2)
+        out = model(data)  # Now returns logits (without sigmoid)
+        loss = criterion(out, data.y)
         loss.backward()
         optimizer.step()
-        print(f"Epoch {epoch + 1} Loss {loss:.4f}")
+        scheduler.step(loss)
+
         if loss < best_loss:
             best_loss = loss
-            no_improve = 0
-        else:
-            no_improve += 1
-        if no_improve >= patience:
-            break
+            torch.save(model.state_dict(), 'best_model.pth')
+
+        print(f'Epoch {epoch + 1}: Loss {loss.item():.4f}')
+
+    model.load_state_dict(torch.load('best_model.pth'))
     return model
 
-def predict_and_adjust(model, data, graph, candidates, node_id_to_idx):
-    model.eval()
-    with torch.no_grad():
-        predictions = model(data).squeeze().numpy()
-    candidates['pred_prob'] = candidates['node_id'].map(lambda nid: predictions[node_id_to_idx[nid]] if nid in node_id_to_idx else 0.0)
-    final_stops = candidates[candidates['pred_prob'] > 0.5]
-    if final_stops.empty:
-        final_stops = candidates.nlargest(1, 'pred_prob')
-    return final_stops
 
+# 7. Visualization Function
+def create_results_map(existing_stops, predictions, grid_gdf):
+    existing_stops = existing_stops.dropna(subset=['Latitude', 'Longitude'])
+    predictions = predictions.dropna(subset=['Latitude', 'Longitude'])
+
+    existing_stops[['Latitude', 'Longitude']] = existing_stops[['Latitude', 'Longitude']].apply(pd.to_numeric,
+                                                                                                errors='coerce')
+    predictions[['Latitude', 'Longitude']] = predictions[['Latitude', 'Longitude']].apply(pd.to_numeric,
+                                                                                          errors='coerce')
+
+    existing_stops = existing_stops.dropna(subset=['Latitude', 'Longitude'])
+    predictions = predictions.dropna(subset=['Latitude', 'Longitude'])
+
+    avg_lat = np.mean([existing_stops.Latitude.mean(), predictions.Latitude.mean()])
+    avg_lon = np.mean([existing_stops.Longitude.mean(), predictions.Longitude.mean()])
+
+    if np.isnan(avg_lat) or np.isnan(avg_lon):
+        avg_lat, avg_lon = 50.8503, 4.3517
+
+    m = folium.Map(location=[avg_lat, avg_lon], zoom_start=14, tiles='CartoDB positron')
+
+    grid_layer = folium.FeatureGroup(name='Density Grid')
+    for _, grid in grid_gdf.iterrows():
+        if all(col in grid for col in ['min_lat', 'min_lon', 'max_lat', 'max_lon', 'density_rank']):
+            grid_layer.add_child(
+                folium.Rectangle(
+                    bounds=[[grid['min_lat'], grid['min_lon']],
+                            [grid['max_lat'], grid['max_lon']]],
+                    color='#ff0000',
+                    fill=True,
+                    fill_color='YlOrRd',
+                    fill_opacity=0.2 * grid['density_rank'],
+                    popup=f"Density Rank: {grid['density_rank']}"
+                )
+            )
+    m.add_child(grid_layer)
+
+    existing_layer = folium.FeatureGroup(name='Existing Stops')
+    for _, stop in existing_stops.iterrows():
+        existing_layer.add_child(
+            folium.CircleMarker(
+                location=[stop['Latitude'], stop['Longitude']],
+                radius=6,
+                color='#00cc00',
+                fill=True,
+                popup=f"Name: {stop.get('Stop_Name', 'N/A')}<br>"
+                      f"Density Rank: {stop['density_rank']}<br>"
+                      f"POI Count: {stop['POI_Count']}"
+            )
+        )
+    m.add_child(existing_layer)
+
+    pred_layer = folium.FeatureGroup(name='Predicted Stops')
+    for _, pred in predictions.iterrows():
+        pred_layer.add_child(
+            folium.CircleMarker(
+                location=[pred['Latitude'], pred['Longitude']],
+                radius=5 + 8 * pred['pred_prob'],
+                color='#0066cc',
+                fill=True,
+                fill_opacity=0.7,
+                popup=f"Probability: {pred['pred_prob']:.2f}<br>"
+                      f"Density Rank: {pred['density_rank']}<br>"
+                      f"POIs: {pred['POI_Count']}"
+            )
+        )
+    m.add_child(pred_layer)
+
+    folium.LayerControl(collapsed=False).add_to(m)
+    title_html = '''
+         <h3 align="center" style="font-size:16px"><b>Bus Stop Predictions</b></h3>
+         <div style="text-align:center;">
+             <span style="color: #00cc00;">■</span> Existing Stops &nbsp;
+             <span style="color: #0066cc;">■</span> Predicted Stops
+         </div>
+    '''
+    m.get_root().html.add_child(folium.Element(title_html))
+
+    return m
+
+
+#8. Save result
+def save_predictions(predictions, output_file):
+    """Save predictions to ODS format"""
+    predictions = predictions.astype({
+        'Latitude': np.float32,
+        'Longitude': np.float32,
+        'density_rank': np.int8,
+        'POI_Count': np.int16,
+        'pred_prob': np.float32
+    })
+
+    # Convert pandas DataFrame to a dictionary for pyexcel to handle
+    predictions_dict = predictions.to_dict(orient='records')
+
+    # Save to ODS using pyexcel
+    pe.save_as(records=predictions_dict, dest_file_name=output_file)
+
+
+# 9. Main Workflow
 def main():
-    grid_data = load_grid_data("grid_density_data.ods")
-    graph, _, pois = get_osm_data()
-    candidates = generate_candidates(graph, grid_data)
+    grid_gdf = load_grid_data("Training Data/city_grid_density.ods")
+    graph = ox.graph_from_place("Brussels, Belgium", network_type='drive', simplify=True)
+    bus_stops = load_bus_stops("Training Data/stib_stops.ods", grid_gdf, graph)
+    pois = ox.features_from_place("Brussels, Belgium", tags={'amenity': True})
+
+    bus_stops = calculate_poi_density(bus_stops, pois)
+    candidates = generate_candidates(graph, bus_stops, grid_gdf)
     candidates = calculate_poi_density(candidates, pois)
-    combined = pd.concat([grid_data, candidates], ignore_index=True)
-    graph_data, combined, node_id_to_idx = prepare_graph_data(graph, combined)
-    model = train_model(graph_data)
-    predictions = predict_and_adjust(model, graph_data, graph, combined, node_id_to_idx)
-    m = folium.Map(location=[49.8988, 10.9028], zoom_start=14)
-    for _, stop in predictions.iterrows():
-        folium.CircleMarker(location=[stop.Latitude, stop.Longitude], radius=6, color='#ff0000' if stop.pred_prob > 0.7 else '#ffa500', fill=True, opacity=0.7, popup=f"Score: {stop.pred_prob:.2f}").add_to(m)
-    m.save("Template/optimized_predictions.html")
+
+    # Scale POI_Count across all data
+    bus_stops['node_id'] = ox.distance.nearest_nodes(graph, bus_stops['Longitude'], bus_stops['Latitude'])
+    candidates['node_id'] = ox.distance.nearest_nodes(graph, candidates['Longitude'], candidates['Latitude'])
+
+    # Combine datasets with proper node_id handling
+    combined = pd.concat([
+        bus_stops[['node_id', 'Latitude', 'Longitude', 'Normalized_Density', 'POI_Count', 'density_rank']],
+        candidates[['node_id', 'Latitude', 'Longitude', 'Normalized_Density', 'POI_Count', 'density_rank']]
+    ], ignore_index=True)
+
+    graph_data, unique_nodes = prepare_graph_data(graph, combined)
+
+    # Assign correct labels (1 for existing stops, 0 for candidates)
+    existing_node_ids = set(bus_stops['node_id'])
+    graph_data.y = torch.tensor(
+        [1 if node_id in existing_node_ids else 0 for node_id in unique_nodes],
+        dtype=torch.float32
+    )
+
+    model = BusStopPredictor()
+    model = train_model(model, graph_data)
+
+    with torch.no_grad():
+        logits = model(graph_data).numpy()
+        pred_prob = torch.sigmoid(torch.tensor(logits)).numpy()
+
+    predictions_df = pd.DataFrame({
+        'node_id': unique_nodes,
+        'pred_prob': pred_prob
+    }).merge(
+        combined[['node_id', 'Latitude', 'Longitude', 'density_rank', 'POI_Count']],
+        on='node_id',
+        how='left'
+    )
+
+    # Adaptive thresholding based on density rank
+    threshold_map = {5: 0.3, 4: 0.4, 3: 0.5, 2: 0.6, 1: 0.7}
+    predictions_df['threshold'] = predictions_df['density_rank'].map(threshold_map)
+    new_predictions = predictions_df[
+        (~predictions_df['node_id'].isin(existing_node_ids)) &
+        (predictions_df['pred_prob'] > predictions_df['threshold'])
+        ]
+
+    # Ensure minimum stops per density rank
+    min_stops = {5: 20, 4: 15, 3: 10, 2: 5, 1: 2}
+    final_selection = []
+    for rank, count in min_stops.items():
+        rank_predictions = new_predictions[new_predictions['density_rank'] == rank]
+        if len(rank_predictions) >= count:
+            final_selection.append(rank_predictions.nlargest(count, 'pred_prob'))
+        else:
+            final_selection.append(rank_predictions)
+
+    final_predictions = pd.concat(final_selection)
+
+    save_predictions(new_predictions, 'Model Data/bus_stop_predictions.ods')
+
+    result_map = create_results_map(
+        bus_stops,
+        new_predictions[['Latitude', 'Longitude', 'density_rank', 'POI_Count', 'pred_prob']],
+        grid_gdf
+    )
+    result_map.save("Template/bus_stop_predictions_map.html")
+
 
 if __name__ == "__main__":
     main()
+
+
