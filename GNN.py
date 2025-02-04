@@ -106,7 +106,6 @@ def generate_candidates(graph, existing_stops, grid_gdf):
     )
 
 
-
 # 4. Calculate POI Density
 def calculate_poi_density(points_gdf, pois_gdf, radius=500):
     """Calculate POI density around candidate points."""
@@ -179,8 +178,7 @@ def prepare_graph_data(graph, combined_data):
     return Data(
         x=torch.tensor(features, dtype=torch.float32),
         edge_index=torch.tensor(edge_list, dtype=torch.long).t().contiguous()
-    ), combined_data, node_id_to_idx
-
+    )
 
 
 # 6. Train Model
@@ -196,6 +194,7 @@ class BusStopPredictor(torch.nn.Module):
         x = F.relu(self.conv1(x, edge_index))
         x = F.relu(self.conv2(x, edge_index))
         return torch.sigmoid(self.predictor(x)).squeeze()
+
 
 # 6. Training & Prediction ----------------------------------------------------
 def train_model(model, data, epochs=300):
@@ -293,6 +292,7 @@ def create_results_map(existing_stops, predictions, grid_gdf):
 
     return m
 
+
 #8. Save result---------------------------------------------------------------
 def save_predictions(predictions, output_file):
     """Save predictions to ODS with optimized formatting"""
@@ -346,11 +346,14 @@ def main():
     ], ignore_index=True)
 
     # Prepare graph data
-    graph_data, node_features = prepare_graph_data(graph, combined)
+    graph_data = prepare_graph_data(graph, combined)
 
-    # Create labels
+    # Get node IDs for bus stops and candidates
+    node_ids = combined['node_id'].values  # Get the node IDs from the combined data
+
+    # Create the labels for the bus stops and candidates
     graph_data.y = torch.tensor(
-        [1 if id in bus_stops['node_id'].values else 0 for id in node_features['node_id']],
+        [1 if node_id in node_ids else 0 for node_id in range(graph_data.x.shape[0])],
         dtype=torch.float32
     )
 
@@ -360,10 +363,21 @@ def main():
 
     # Generate predictions
     with torch.no_grad():
-        node_features['pred_prob'] = model(graph_data).numpy()
+        pred_prob = model(graph_data).numpy()  # Get model predictions
 
-    # Filter and save results
+    # Ensure the model output aligns with the bus stop node_ids
+    node_features = combined.copy()
+
+    # Get corresponding indices for the node_ids
+    node_id_to_pred_prob = dict(zip(node_ids, pred_prob))
+
+    # Assign prediction probabilities to the node features
+    node_features['pred_prob'] = node_features['node_id'].map(node_id_to_pred_prob)
+
+    # Filter results where pred_prob is greater than 0.5
     predictions = node_features[node_features['pred_prob'] > 0.5]
+
+    # Save results
     save_predictions(predictions[['Latitude', 'Longitude', 'density_rank',
                                   'POI_Count', 'pred_prob']],
                      "bus_stop_predictions.ods")
@@ -379,3 +393,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
