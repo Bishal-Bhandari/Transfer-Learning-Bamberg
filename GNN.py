@@ -80,13 +80,16 @@ def load_bus_stops(stop_file, grid_gdf, graph):
 
 # 3. Generate Candidates
 def generate_candidates(graph, existing_stops, grid_gdf):
-    """Generate candidates based on grid density"""
+    """Generate candidates with junction avoidance and enhanced density sampling"""
     nodes = ox.graph_to_gdfs(graph, nodes=True, edges=False)
 
-    # Filter out existing stop nodes
+    # Calculate node degrees and filter out junctions (nodes with degree > 3)
+    degrees = pd.Series(dict(graph.degree()))
+    nodes = nodes[degrees <= 3]  # Exclude nodes with more than 3 connections
+
     candidate_nodes = nodes[~nodes.index.isin(existing_stops['node_id'])]
 
-    # Create GeoDataFrame with geometry
+    # Create GeoDataFrame
     candidate_gdf = gpd.GeoDataFrame(
         candidate_nodes[['y', 'x']].reset_index(),
         geometry=gpd.points_from_xy(candidate_nodes.x, candidate_nodes.y),
@@ -96,18 +99,22 @@ def generate_candidates(graph, existing_stops, grid_gdf):
     # Join with grid data
     candidates = gpd.sjoin(candidate_gdf, grid_gdf[['geometry', 'density_rank']],
                            how='left', predicate='within')
-
-    # Ensure missing `density_rank` values are handled
     candidates['density_rank'] = candidates['density_rank'].fillna(1).astype(int)
 
-    sample_weights = {5: 0.8, 4: 0.6, 3: 0.4, 2: 0.2, 1: 0.1}
-    sampled = [candidates[candidates['density_rank'] == rank].sample(frac=weight, replace=True)
-               for rank, weight in sample_weights.items() if not candidates[candidates['density_rank'] == rank].empty]
+    # Enhanced sampling weights for density ranks
+    sample_weights = {5: 1.0, 4: 0.8, 3: 0.5, 2: 0.2, 1: 0.1}  # More aggressive sampling
+    sampled = []
+
+    for rank, weight in sample_weights.items():
+        pool = candidates[candidates['density_rank'] == rank]
+        if not pool.empty:
+            # Ensure minimum of 20% of available nodes per rank are sampled
+            min_samples = max(int(0.2 * len(pool)), 1)
+            sampled.append(pool.sample(n=min_samples + int(weight * len(pool)), replace=True))
 
     final_candidates = pd.concat(sampled)
     final_candidates['Normalized_Density'] = final_candidates['density_rank'] / 5.0
 
-    # Ensure `density_rank` remains in the final DataFrame
     return final_candidates[['y', 'x', 'Normalized_Density', 'density_rank']].rename(
         columns={'y': 'Latitude', 'x': 'Longitude'}
     )
@@ -163,14 +170,24 @@ def calculate_poi_density(points_gdf, pois_gdf, radius=500):
 # 5. Prepare Graph Data
 def prepare_graph_data(graph, combined_data):
     """Create graph structure for GNN ensuring valid edges."""
-    combined_data['node_id'] = ox.distance.nearest_nodes(
-        graph,
-        combined_data['Longitude'],
-        combined_data['Latitude']
+    combined_data['Density_POI_Interaction'] = (
+            combined_data['Normalized_Density'] *
+            combined_data['POI_Count']
     )
 
-    # Filter only nodes that exist in the dataset
-    valid_nodes = set(combined_data['node_id'])
+    # Extract nodes correctly
+    nodes = ox.graph_to_gdfs(graph, nodes=True, edges=False)
+    valid_nodes = set(nodes.index)  # Extract valid node IDs
+
+    # Ensure combined_data has 'node_id'
+    if 'node_id' not in combined_data.columns:
+        raise ValueError("Error: 'node_id' column missing in combined_data.")
+
+    features = combined_data.groupby('node_id')[
+        ['Normalized_Density', 'POI_Count', 'Density_POI_Interaction']
+    ].mean()
+
+    # Filter edges based on valid nodes
     edge_list = [[u, v] for u, v in graph.edges() if u in valid_nodes and v in valid_nodes]
 
     unique_nodes = sorted(valid_nodes)
@@ -179,7 +196,6 @@ def prepare_graph_data(graph, combined_data):
     # Ensure edge indices are mapped correctly
     edge_list = [[node_id_to_idx[u], node_id_to_idx[v]] for u, v in edge_list if u in node_id_to_idx and v in node_id_to_idx]
 
-    features = combined_data.groupby('node_id')[['Normalized_Density', 'POI_Count']].mean()
     features = features.reindex(unique_nodes).fillna(0).values  # Ensure correct ordering
 
     data = Data(
@@ -190,23 +206,27 @@ def prepare_graph_data(graph, combined_data):
     return data, unique_nodes
 
 
+
+
 # 6. Train Model
 class BusStopPredictor(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = GCNConv(2, 128)
-        self.dropout1 = torch.nn.Dropout(0.5)
-        self.conv2 = GCNConv(128, 64)
-        self.dropout2 = torch.nn.Dropout(0.5)
-        self.predictor = torch.nn.Linear(64, 1)
+        self.conv1 = GCNConv(3, 256)  # Increased input features and hidden size
+        self.conv2 = GCNConv(256, 128)
+        self.conv3 = GCNConv(128, 64)  # Additional layer
+        self.predictor = torch.nn.Sequential(
+            torch.nn.Linear(64, 32),
+            torch.nn.ReLU(),
+            torch.nn.Linear(32, 1)
+        )
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
         x = F.relu(self.conv1(x, edge_index))
-        x = self.dropout1(x)
         x = F.relu(self.conv2(x, edge_index))
-        x = self.dropout2(x)
-        return self.predictor(x).squeeze()  # Return raw logits
+        x = F.relu(self.conv3(x, edge_index))
+        return self.predictor(x).squeeze()
 
 
 # 6. Training & Prediction
@@ -352,12 +372,14 @@ def main():
     candidates = calculate_poi_density(candidates, pois)
 
     # Scale POI_Count across all data
-    poi_scaler = MinMaxScaler()
+    bus_stops['node_id'] = ox.distance.nearest_nodes(graph, bus_stops['Longitude'], bus_stops['Latitude'])
+    candidates['node_id'] = ox.distance.nearest_nodes(graph, candidates['Longitude'], candidates['Latitude'])
+
+    # Combine datasets with proper node_id handling
     combined = pd.concat([
-        bus_stops[['Latitude', 'Longitude', 'Normalized_Density', 'POI_Count', 'density_rank']],
-        candidates[['Latitude', 'Longitude', 'Normalized_Density', 'POI_Count', 'density_rank']]
+        bus_stops[['node_id', 'Latitude', 'Longitude', 'Normalized_Density', 'POI_Count', 'density_rank']],
+        candidates[['node_id', 'Latitude', 'Longitude', 'Normalized_Density', 'POI_Count', 'density_rank']]
     ], ignore_index=True)
-    combined['POI_Count'] = poi_scaler.fit_transform(combined[['POI_Count']])
 
     graph_data, unique_nodes = prepare_graph_data(graph, combined)
 
@@ -373,7 +395,7 @@ def main():
 
     with torch.no_grad():
         logits = model(graph_data).numpy()
-        pred_prob = torch.sigmoid(torch.tensor(logits)).numpy()  # Apply sigmoid here
+        pred_prob = torch.sigmoid(torch.tensor(logits)).numpy()
 
     predictions_df = pd.DataFrame({
         'node_id': unique_nodes,
@@ -384,11 +406,25 @@ def main():
         how='left'
     )
 
-    # Filter out existing stops and select high-probability candidates
+    # Adaptive thresholding based on density rank
+    threshold_map = {5: 0.3, 4: 0.4, 3: 0.5, 2: 0.6, 1: 0.7}
+    predictions_df['threshold'] = predictions_df['density_rank'].map(threshold_map)
     new_predictions = predictions_df[
         (~predictions_df['node_id'].isin(existing_node_ids)) &
-        (predictions_df['pred_prob'] > 0.5)
-    ]
+        (predictions_df['pred_prob'] > predictions_df['threshold'])
+        ]
+
+    # Ensure minimum stops per density rank
+    min_stops = {5: 20, 4: 15, 3: 10, 2: 5, 1: 2}
+    final_selection = []
+    for rank, count in min_stops.items():
+        rank_predictions = new_predictions[new_predictions['density_rank'] == rank]
+        if len(rank_predictions) >= count:
+            final_selection.append(rank_predictions.nlargest(count, 'pred_prob'))
+        else:
+            final_selection.append(rank_predictions)
+
+    final_predictions = pd.concat(final_selection)
 
     save_predictions(new_predictions, 'Model Data/bus_stop_predictions.ods')
 
