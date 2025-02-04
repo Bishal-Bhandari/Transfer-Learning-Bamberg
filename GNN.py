@@ -237,7 +237,7 @@ def train_model(model, data, epochs=300):
 
         print(f'Epoch {epoch + 1}: Loss {loss.item():.4f}')
 
-    model.load_state_dict(torch.load('Model Data/best_model.pth'))
+    model.load_state_dict(torch.load('best_model.pth'))
     return model
 
 
