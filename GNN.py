@@ -182,10 +182,12 @@ def prepare_graph_data(graph, combined_data):
     features = combined_data.groupby('node_id')[['Normalized_Density', 'POI_Count']].mean()
     features = features.reindex(unique_nodes).fillna(0).values  # Ensure correct ordering
 
-    return Data(
+    data = Data(
         x=torch.tensor(features, dtype=torch.float32),
         edge_index=torch.tensor(edge_list, dtype=torch.long).t().contiguous()
     )
+
+    return data, unique_nodes
 
 
 # 6. Train Model
@@ -193,27 +195,38 @@ class BusStopPredictor(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.conv1 = GCNConv(2, 128)
+        self.dropout1 = torch.nn.Dropout(0.5)
         self.conv2 = GCNConv(128, 64)
+        self.dropout2 = torch.nn.Dropout(0.5)
         self.predictor = torch.nn.Linear(64, 1)
 
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
         x = F.relu(self.conv1(x, edge_index))
+        x = self.dropout1(x)
         x = F.relu(self.conv2(x, edge_index))
-        return torch.sigmoid(self.predictor(x)).squeeze()
+        x = self.dropout2(x)
+        return self.predictor(x).squeeze()  # Return raw logits
 
 
 # 6. Training & Prediction
 def train_model(model, data, epochs=300):
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-4)
+
+    # Calculate class weights and move to correct device
+    pos_weight = torch.tensor([(len(data.y) - data.y.sum()) / data.y.sum()]).to(data.x.device)
+
+    # Use BCEWithLogitsLoss instead of BCELoss
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10)
 
     best_loss = float('inf')
     for epoch in range(epochs):
         model.train()
         optimizer.zero_grad()
-        out = model(data)
-        loss = F.binary_cross_entropy(out, data.y)
+        out = model(data)  # Now returns logits (without sigmoid)
+        loss = criterion(out, data.y)
         loss.backward()
         optimizer.step()
         scheduler.step(loss)
@@ -224,43 +237,33 @@ def train_model(model, data, epochs=300):
 
         print(f'Epoch {epoch + 1}: Loss {loss.item():.4f}')
 
-    model.load_state_dict(torch.load('best_model.pth'))
+    model.load_state_dict(torch.load('Model Data/best_model.pth'))
     return model
 
 
 # 7. Visualization Function
 def create_results_map(existing_stops, predictions, grid_gdf):
-    """Create interactive Folium map with layers"""
-
-    # Drop NaN values in latitude and longitude columns
     existing_stops = existing_stops.dropna(subset=['Latitude', 'Longitude'])
     predictions = predictions.dropna(subset=['Latitude', 'Longitude'])
 
-    # Ensure columns are numeric (if they aren't, force conversion)
     existing_stops[['Latitude', 'Longitude']] = existing_stops[['Latitude', 'Longitude']].apply(pd.to_numeric,
                                                                                                 errors='coerce')
     predictions[['Latitude', 'Longitude']] = predictions[['Latitude', 'Longitude']].apply(pd.to_numeric,
                                                                                           errors='coerce')
 
-    # Drop any rows where Latitude or Longitude is still NaN after conversion
     existing_stops = existing_stops.dropna(subset=['Latitude', 'Longitude'])
     predictions = predictions.dropna(subset=['Latitude', 'Longitude'])
 
-    # Calculate map center
     avg_lat = np.mean([existing_stops.Latitude.mean(), predictions.Latitude.mean()])
     avg_lon = np.mean([existing_stops.Longitude.mean(), predictions.Longitude.mean()])
 
-    # Check if avg_lat or avg_lon is NaN and set a default value if so
     if np.isnan(avg_lat) or np.isnan(avg_lon):
-        avg_lat, avg_lon = 50.8503, 4.3517  # Default location (Brussels)
+        avg_lat, avg_lon = 50.8503, 4.3517
 
-    # Create base map centered on the average lat/lon
     m = folium.Map(location=[avg_lat, avg_lon], zoom_start=14, tiles='CartoDB positron')
 
-    # Add grid layer (ensure grid data has proper bounds for latitudes and longitudes)
     grid_layer = folium.FeatureGroup(name='Density Grid')
     for _, grid in grid_gdf.iterrows():
-        # Check for the existence of the necessary columns in grid_gdf
         if all(col in grid for col in ['min_lat', 'min_lon', 'max_lat', 'max_lon', 'density_rank']):
             grid_layer.add_child(
                 folium.Rectangle(
@@ -275,7 +278,6 @@ def create_results_map(existing_stops, predictions, grid_gdf):
             )
     m.add_child(grid_layer)
 
-    # Add existing stops layer
     existing_layer = folium.FeatureGroup(name='Existing Stops')
     for _, stop in existing_stops.iterrows():
         existing_layer.add_child(
@@ -291,13 +293,12 @@ def create_results_map(existing_stops, predictions, grid_gdf):
         )
     m.add_child(existing_layer)
 
-    # Add predictions layer
     pred_layer = folium.FeatureGroup(name='Predicted Stops')
     for _, pred in predictions.iterrows():
         pred_layer.add_child(
             folium.CircleMarker(
                 location=[pred['Latitude'], pred['Longitude']],
-                radius=5 + 8 * pred['pred_prob'],  # Scale radius by probability
+                radius=5 + 8 * pred['pred_prob'],
                 color='#0066cc',
                 fill=True,
                 fill_opacity=0.7,
@@ -308,7 +309,6 @@ def create_results_map(existing_stops, predictions, grid_gdf):
         )
     m.add_child(pred_layer)
 
-    # Add layer control and title
     folium.LayerControl(collapsed=False).add_to(m)
     title_html = '''
          <h3 align="center" style="font-size:16px"><b>Bus Stop Predictions</b></h3>
@@ -340,72 +340,61 @@ def save_predictions(predictions, output_file):
     pe.save_as(records=predictions_dict, dest_file_name=output_file)
 
 
-# 9. Updated Main Workflow
+# 9. Main Workflow
 def main():
-    # Load input data
     grid_gdf = load_grid_data("Training Data/city_grid_density.ods")
-
-    # Get OSM data first
     graph = ox.graph_from_place("Brussels, Belgium", network_type='drive', simplify=True)
-
-    # Load bus stops with graph reference
     bus_stops = load_bus_stops("Training Data/stib_stops.ods", grid_gdf, graph)
-
-    # Get POIs
     pois = ox.features_from_place("Brussels, Belgium", tags={'amenity': True})
 
-    # Calculate POI counts for existing stops
-    bus_stops = calculate_poi_density(bus_stops, pois)  # Add this line
-
-    # Generate candidates
+    bus_stops = calculate_poi_density(bus_stops, pois)
     candidates = generate_candidates(graph, bus_stops, grid_gdf)
     candidates = calculate_poi_density(candidates, pois)
 
-    # Combine datasets
+    # Scale POI_Count across all data
+    poi_scaler = MinMaxScaler()
     combined = pd.concat([
         bus_stops[['Latitude', 'Longitude', 'Normalized_Density', 'POI_Count', 'density_rank']],
         candidates[['Latitude', 'Longitude', 'Normalized_Density', 'POI_Count', 'density_rank']]
     ], ignore_index=True)
+    combined['POI_Count'] = poi_scaler.fit_transform(combined[['POI_Count']])
 
-    # Prepare graph data
-    graph_data = prepare_graph_data(graph, combined)
+    graph_data, unique_nodes = prepare_graph_data(graph, combined)
 
-    # Get node IDs for bus stops and candidates
-    node_ids = combined['node_id'].values  # Get the node IDs from the combined data
-
-    # Create the labels for the bus stops and candidates
+    # Assign correct labels (1 for existing stops, 0 for candidates)
+    existing_node_ids = set(bus_stops['node_id'])
     graph_data.y = torch.tensor(
-        [1 if node_id in node_ids else 0 for node_id in range(graph_data.x.shape[0])],
+        [1 if node_id in existing_node_ids else 0 for node_id in unique_nodes],
         dtype=torch.float32
     )
 
-    # Train model
     model = BusStopPredictor()
     model = train_model(model, graph_data)
 
-    # Generate predictions
     with torch.no_grad():
-        pred_prob = model(graph_data).numpy()  # Get model predictions
+        logits = model(graph_data).numpy()
+        pred_prob = torch.sigmoid(torch.tensor(logits)).numpy()  # Apply sigmoid here
 
-    # Ensure the model output aligns with the bus stop node_ids
-    node_features = combined.copy()
+    predictions_df = pd.DataFrame({
+        'node_id': unique_nodes,
+        'pred_prob': pred_prob
+    }).merge(
+        combined[['node_id', 'Latitude', 'Longitude', 'density_rank', 'POI_Count']],
+        on='node_id',
+        how='left'
+    )
 
-    # Get corresponding indices for the node_ids
-    node_id_to_pred_prob = dict(zip(node_ids, pred_prob))
+    # Filter out existing stops and select high-probability candidates
+    new_predictions = predictions_df[
+        (~predictions_df['node_id'].isin(existing_node_ids)) &
+        (predictions_df['pred_prob'] > 0.5)
+    ]
 
-    # Assign prediction probabilities to the node features
-    node_features['pred_prob'] = node_features['node_id'].map(node_id_to_pred_prob)
+    save_predictions(new_predictions, 'Model Data/bus_stop_predictions.ods')
 
-    # Filter results where pred_prob is greater than 0.5
-    predictions = node_features[node_features['pred_prob'] > 0.3]
-
-    # Save results
-    save_predictions(predictions, 'Model Data/bus_stop_predictions.ods')
-
-    # Create and save interactive map
     result_map = create_results_map(
         bus_stops,
-        predictions[['Latitude', 'Longitude', 'density_rank', 'POI_Count', 'pred_prob']],
+        new_predictions[['Latitude', 'Longitude', 'density_rank', 'POI_Count', 'pred_prob']],
         grid_gdf
     )
     result_map.save("Template/bus_stop_predictions_map.html")
