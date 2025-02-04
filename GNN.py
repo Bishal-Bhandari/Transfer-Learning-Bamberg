@@ -295,7 +295,6 @@ def create_results_map(existing_stops, predictions, grid_gdf):
 
 #8. Save result---------------------------------------------------------------
 def save_predictions(predictions, output_file):
-    """Save predictions to ODS with optimized formatting"""
     predictions = predictions.astype({
         'Latitude': np.float32,
         'Longitude': np.float32,
@@ -304,18 +303,8 @@ def save_predictions(predictions, output_file):
         'pred_prob': np.float32
     })
 
-    with pd.ExcelWriter(output_file, engine='odf') as writer:
-        predictions.to_excel(writer, index=False, sheet_name='Predictions',
-                             float_format="%.3f")
-
-        # Formatting
-        workbook = writer.book
-        worksheet = writer.sheets['Predictions']
-        worksheet.column(0, 0).width = 12  # Latitude
-        worksheet.column(1, 1).width = 12  # Longitude
-        worksheet.column(2, 2).width = 10  # Density Rank
-        worksheet.column(3, 3).width = 10  # POI Count
-        worksheet.column(4, 4).width = 14  # Probability
+    # Save predictions to ODS
+    predictions.to_ods(output_file)
 
 
 # 9. Updated Main Workflow ----------------------------------------------------
@@ -378,9 +367,7 @@ def main():
     predictions = node_features[node_features['pred_prob'] > 0.5]
 
     # Save results
-    save_predictions(predictions[['Latitude', 'Longitude', 'density_rank',
-                                  'POI_Count', 'pred_prob']],
-                     "bus_stop_predictions.ods")
+    save_predictions(predictions, 'bus_stop_predictions.ods')
 
     # Create and save interactive map
     result_map = create_results_map(
