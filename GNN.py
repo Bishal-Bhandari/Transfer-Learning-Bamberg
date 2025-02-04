@@ -397,7 +397,7 @@ def main():
     node_features['pred_prob'] = node_features['node_id'].map(node_id_to_pred_prob)
 
     # Filter results where pred_prob is greater than 0.5
-    predictions = node_features[node_features['pred_prob'] > 0.5]
+    predictions = node_features[node_features['pred_prob'] > 0.3]
 
     # Save results
     save_predictions(predictions, 'Model Data/bus_stop_predictions.ods')
