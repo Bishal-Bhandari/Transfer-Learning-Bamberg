@@ -156,19 +156,31 @@ def calculate_poi_density(points_gdf, pois_gdf, radius=500):
 
 # 5. Prepare Graph Data
 def prepare_graph_data(graph, combined_data):
-    combined_data['node_id'] = ox.distance.nearest_nodes(graph, combined_data['Longitude'], combined_data['Latitude'])
+    """Create graph structure for GNN ensuring valid edges."""
+    combined_data['node_id'] = ox.distance.nearest_nodes(
+        graph,
+        combined_data['Longitude'],
+        combined_data['Latitude']
+    )
 
-    node_features = combined_data.groupby('node_id').agg(
-        {'Normalized_Density': 'max', 'POI_Count': 'max'}).reset_index()
+    # Filter only nodes that exist in the dataset
+    valid_nodes = set(combined_data['node_id'])
+    edge_list = [[u, v] for u, v in graph.edges() if u in valid_nodes and v in valid_nodes]
 
-    edge_list = [[u, v] for u, v in graph.edges() if
-                 u in node_features['node_id'].values and v in node_features['node_id'].values]
+    unique_nodes = sorted(valid_nodes)
+    node_id_to_idx = {nid: idx for idx, nid in enumerate(unique_nodes)}
 
-    if not edge_list:
-        raise ValueError("No valid edges found.")
+    # Ensure edge indices are mapped correctly
+    edge_list = [[node_id_to_idx[u], node_id_to_idx[v]] for u, v in edge_list if u in node_id_to_idx and v in node_id_to_idx]
 
-    return Data(x=torch.tensor(node_features[['Normalized_Density', 'POI_Count']].values, dtype=torch.float32),
-                edge_index=torch.tensor(edge_list, dtype=torch.long).t().contiguous()), node_features
+    features = combined_data.groupby('node_id')[['Normalized_Density', 'POI_Count']].mean()
+    features = features.reindex(unique_nodes).fillna(0).values  # Ensure correct ordering
+
+    return Data(
+        x=torch.tensor(features, dtype=torch.float32),
+        edge_index=torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+    ), combined_data, node_id_to_idx
+
 
 
 # 6. Train Model
