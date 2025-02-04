@@ -12,6 +12,7 @@ from tqdm import tqdm
 import geopandas as gpd
 from joblib import Parallel, delayed
 from shapely.geometry import Polygon, Point, MultiPolygon
+import pyexcel as pe
 
 ox.settings.log_console = True
 ox.settings.use_cache = True
@@ -24,6 +25,9 @@ def load_grid_data(grid_file):
                             dtype={'min_lat': np.float32, 'max_lat': np.float32,
                                    'min_lon': np.float32, 'max_lon': np.float32,
                                    'density_rank': np.int8})
+
+    # Filter out rows with NaN values in critical columns
+    grid_df = grid_df.dropna(subset=['min_lat', 'max_lat', 'min_lon', 'max_lon', 'density_rank'])
 
     # Create polygons
     grid_df['geometry'] = grid_df.apply(lambda row: Polygon([
@@ -51,6 +55,9 @@ def load_bus_stops(stop_file, grid_gdf, graph):
         raise ValueError(f"Latitude/Longitude columns not found. Available columns: {stops.columns.tolist()}")
 
     stops = stops.rename(columns={lat_col: 'Latitude', lon_col: 'Longitude'})
+
+    # Filter out rows with NaN in 'Latitude' or 'Longitude'
+    stops = stops.dropna(subset=['Latitude', 'Longitude'])
 
     # Convert to GeoDataFrame
     gdf = gpd.GeoDataFrame(stops, geometry=gpd.points_from_xy(stops.Longitude, stops.Latitude), crs="EPSG:4326")
@@ -196,7 +203,7 @@ class BusStopPredictor(torch.nn.Module):
         return torch.sigmoid(self.predictor(x)).squeeze()
 
 
-# 6. Training & Prediction ----------------------------------------------------
+# 6. Training & Prediction
 def train_model(model, data, epochs=300):
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=10)
@@ -221,29 +228,51 @@ def train_model(model, data, epochs=300):
     return model
 
 
-# 7. Visualization Function ---------------------------------------------------
+# 7. Visualization Function
 def create_results_map(existing_stops, predictions, grid_gdf):
     """Create interactive Folium map with layers"""
+
+    # Drop NaN values in latitude and longitude columns
+    existing_stops = existing_stops.dropna(subset=['Latitude', 'Longitude'])
+    predictions = predictions.dropna(subset=['Latitude', 'Longitude'])
+
+    # Ensure columns are numeric (if they aren't, force conversion)
+    existing_stops[['Latitude', 'Longitude']] = existing_stops[['Latitude', 'Longitude']].apply(pd.to_numeric,
+                                                                                                errors='coerce')
+    predictions[['Latitude', 'Longitude']] = predictions[['Latitude', 'Longitude']].apply(pd.to_numeric,
+                                                                                          errors='coerce')
+
+    # Drop any rows where Latitude or Longitude is still NaN after conversion
+    existing_stops = existing_stops.dropna(subset=['Latitude', 'Longitude'])
+    predictions = predictions.dropna(subset=['Latitude', 'Longitude'])
+
     # Calculate map center
     avg_lat = np.mean([existing_stops.Latitude.mean(), predictions.Latitude.mean()])
     avg_lon = np.mean([existing_stops.Longitude.mean(), predictions.Longitude.mean()])
 
+    # Check if avg_lat or avg_lon is NaN and set a default value if so
+    if np.isnan(avg_lat) or np.isnan(avg_lon):
+        avg_lat, avg_lon = 50.8503, 4.3517  # Default location (Brussels)
+
+    # Create base map centered on the average lat/lon
     m = folium.Map(location=[avg_lat, avg_lon], zoom_start=14, tiles='CartoDB positron')
 
-    # Add grid layer
+    # Add grid layer (ensure grid data has proper bounds for latitudes and longitudes)
     grid_layer = folium.FeatureGroup(name='Density Grid')
     for _, grid in grid_gdf.iterrows():
-        grid_layer.add_child(
-            folium.Rectangle(
-                bounds=[[grid['min_lat'], grid['min_lon']],
-                        [grid['max_lat'], grid['max_lon']]],
-                color='#ff0000',
-                fill=True,
-                fill_color='YlOrRd',
-                fill_opacity=0.2 * grid['density_rank'],
-                popup=f"Density Rank: {grid['density_rank']}"
+        # Check for the existence of the necessary columns in grid_gdf
+        if all(col in grid for col in ['min_lat', 'min_lon', 'max_lat', 'max_lon', 'density_rank']):
+            grid_layer.add_child(
+                folium.Rectangle(
+                    bounds=[[grid['min_lat'], grid['min_lon']],
+                            [grid['max_lat'], grid['max_lon']]],
+                    color='#ff0000',
+                    fill=True,
+                    fill_color='YlOrRd',
+                    fill_opacity=0.2 * grid['density_rank'],
+                    popup=f"Density Rank: {grid['density_rank']}"
+                )
             )
-        )
     m.add_child(grid_layer)
 
     # Add existing stops layer
@@ -293,8 +322,9 @@ def create_results_map(existing_stops, predictions, grid_gdf):
     return m
 
 
-#8. Save result---------------------------------------------------------------
+#8. Save result
 def save_predictions(predictions, output_file):
+    """Save predictions to ODS format"""
     predictions = predictions.astype({
         'Latitude': np.float32,
         'Longitude': np.float32,
@@ -303,23 +333,26 @@ def save_predictions(predictions, output_file):
         'pred_prob': np.float32
     })
 
-    # Save predictions to ODS
-    predictions.to_ods(output_file)
+    # Convert pandas DataFrame to a dictionary for pyexcel to handle
+    predictions_dict = predictions.to_dict(orient='records')
+
+    # Save to ODS using pyexcel
+    pe.save_as(records=predictions_dict, dest_file_name=output_file)
 
 
-# 9. Updated Main Workflow ----------------------------------------------------
+# 9. Updated Main Workflow
 def main():
     # Load input data
     grid_gdf = load_grid_data("Training Data/city_grid_density.ods")
 
     # Get OSM data first
-    graph = ox.graph_from_place("Bamberg, Germany", network_type='drive', simplify=True)
+    graph = ox.graph_from_place("Brussels, Belgium", network_type='drive', simplify=True)
 
     # Load bus stops with graph reference
     bus_stops = load_bus_stops("Training Data/stib_stops.ods", grid_gdf, graph)
 
     # Get POIs
-    pois = ox.features_from_place("Bamberg, Germany", tags={'amenity': True})
+    pois = ox.features_from_place("Brussels, Belgium", tags={'amenity': True})
 
     # Calculate POI counts for existing stops
     bus_stops = calculate_poi_density(bus_stops, pois)  # Add this line
