@@ -206,8 +206,6 @@ def prepare_graph_data(graph, combined_data):
     return data, unique_nodes
 
 
-
-
 # 6. Train Model
 class BusStopPredictor(torch.nn.Module):
     def __init__(self):
@@ -230,7 +228,7 @@ class BusStopPredictor(torch.nn.Module):
 
 
 # 6. Training & Prediction
-def train_model(model, data, epochs=300):
+def train_model(model, data, epochs=500):
     optimizer = torch.optim.Adam(model.parameters(), lr=0.005, weight_decay=1e-4)
 
     # Calculate class weights and move to correct device
