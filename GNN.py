@@ -400,7 +400,7 @@ def main():
     predictions = node_features[node_features['pred_prob'] > 0.5]
 
     # Save results
-    save_predictions(predictions, 'bus_stop_predictions.ods')
+    save_predictions(predictions, 'Model Data/bus_stop_predictions.ods')
 
     # Create and save interactive map
     result_map = create_results_map(
@@ -408,7 +408,7 @@ def main():
         predictions[['Latitude', 'Longitude', 'density_rank', 'POI_Count', 'pred_prob']],
         grid_gdf
     )
-    result_map.save("bus_stop_predictions_map.html")
+    result_map.save("Template/bus_stop_predictions_map.html")
 
 
 if __name__ == "__main__":
