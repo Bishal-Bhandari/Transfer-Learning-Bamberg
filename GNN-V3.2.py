@@ -3,10 +3,12 @@ import pandas as pd
 import json
 import requests
 import torch
+import numpy as np
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
-import torch.nn.functional as F
+import torch.nn.functional as f
 import osmnx as ox
+import networkx as nx
 
 with open('api_keys.json') as json_file:
     api_keys = json.load(json_file)
@@ -17,10 +19,11 @@ API_KEY = api_keys['Weather_API']['API_key']
 # User input
 # Example usage
 city_name = "Brussels"
-date_time = "2025-02-10 14:00"  # User-given date and time
+date_time = "2025-02-07 14:00"  # date and time
 city_grid_file = "Training Data/city_grid_density.ods"
 stib_stops_file = "Training Data/stib_stops.ods"
 poi_tags_file = "poi_tags.json"
+
 
 def read_city_grid(file_path):
     """ Reads and cleans city grid density data """
@@ -173,30 +176,57 @@ def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=10,
 
 def process_grid_roads(grid):
     """Process road network for a grid cell with feature engineering"""
-    # Define the bounding box as (north, south, east, west)
-    bbox = (grid["max_lat"], grid["min_lat"], grid["max_lon"], grid["min_lon"])
 
-    # Create the graph using the bounding box
-    G = ox.graph_from_bbox(bbox, network_type='drive')
-    G = ox.add_edge_bearings(ox.get_undirected(G))
+    # Correct bounding box order (left, bottom, right, top)
+    bbox = (grid["min_lon"], grid["min_lat"], grid["max_lon"], grid["max_lat"])
 
-    # Feature engineering for edges
+    # Fetch road network
+    G = ox.graph_from_bbox(bbox, network_type='drive', simplify=True)
+
+    # Ensure edges have geometries before adding bearings
     for u, v, data in G.edges(data=True):
-        # Feature 1: Road type importance
-        data['road_type'] = 1 if data.get('highway') in ['motorway', 'trunk'] else 0
+        if 'geometry' not in data:
+            # Approximate geometry as a straight line if missing
+            node_u, node_v = G.nodes[u], G.nodes[v]
+            data['geometry'] = ox.utils_geo.LineString([(node_u['x'], node_u['y']), (node_v['x'], node_v['y'])])
 
-        # Feature 2: Calculate curvature using bearing difference
-        bearings = data.get('bearing', [0, 0])
-        data['curvature'] = abs(bearings[0] - bearings[1]) if isinstance(bearings, list) else 0
+    # Custom bearing calculation to replace outdated ox.add_edge_bearings
+    for u, v, data in G.edges(data=True):
+        geom = data['geometry']
+        coords = list(geom.coords)
+        if len(coords) < 2:
+            continue  # Shouldn't happen as we added LineString with 2 points
+        start = coords[0]
+        end = coords[-1]
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        radians = np.arctan2(dy, dx)
+        bearing = np.degrees(radians) % 360
+        data['bearing'] = bearing
 
-        # Feature 3: Junction check
-        data['is_junction'] = G.degree(u) > 2 or G.degree(v) > 2
+    # Feature engineering
+    for u, v, data in G.edges(data=True):
+        data.setdefault("highway", "")
+        data['road_type'] = int(data["highway"] in {'motorway', 'trunk'})
 
+        # Compute curvature (absolute bearing difference for u-v and v-u directions)
+        bearing = data.get('bearing', 0)
+        reverse_bearing = (bearing + 180) % 360  # Approximate reverse direction
+        data['curvature'] = np.abs(bearing - reverse_bearing)
+
+        # Identify junctions
+        data['is_junction'] = (G.degree(u) > 2 or G.degree(v) > 2)
+    print("1")
     return G
 
 
 def create_gnn_data(G, grid_features):
     """Convert OSMnx graph to PyG Data format with enhanced features"""
+    # Extract the first element from the list
+    grid_data = grid_features[0]['features']
+
+    print("grid_features:", grid_data)  # Debug print
+
     # Node features: [latitude, longitude, degree]
     nodes = []
     for node in G.nodes():
@@ -215,8 +245,17 @@ def create_gnn_data(G, grid_features):
         ])
         edge_indices.append([u, v])
 
-    # Add global grid features to edge features
-    grid_feature_tensor = torch.tensor(list(grid_features.values())).float()
+    # Ensure grid_features is a dictionary and access each feature by key
+    grid_data_tensor = torch.tensor(grid_data['grid_data']).float()
+    poi_score = torch.tensor(grid_data['poi_score']).float()
+    density_rank = torch.tensor(grid_data['density_rank']).float()
+    temperature = torch.tensor(grid_data['temp']).float()
+    rain = torch.tensor(grid_data['rain']).float()
+
+    # Concatenate the grid features into one tensor
+    grid_feature_tensor = torch.cat([grid_data_tensor, poi_score, density_rank, temperature, rain], dim=-1)
+
+    # Add grid features to edge features
     edge_features = [torch.cat([torch.tensor(e), grid_feature_tensor]) for e in edges]
 
     return Data(
@@ -268,7 +307,7 @@ def train_model(grids_data, stib_stops):
 
             # Train
             pred = model(data)
-            loss = F.binary_cross_entropy(pred.squeeze(), labels)
+            loss = f.binary_cross_entropy(pred.squeeze(), labels)
             loss.backward()
             optimizer.step()
 
@@ -296,6 +335,7 @@ def predict_new_stops(model, grid):
             })
 
     return sorted(candidates, key=lambda x: -x['probability'])
+
 
 def main():
     city_grid_data = read_city_grid(city_grid_file)
@@ -341,7 +381,7 @@ def main():
         model.train()
         optimizer.zero_grad()
         pred = model(data).squeeze()
-        loss = F.binary_cross_entropy(pred, labels)
+        loss = f.binary_cross_entropy(pred, labels)
         loss.backward()
         optimizer.step()
 
