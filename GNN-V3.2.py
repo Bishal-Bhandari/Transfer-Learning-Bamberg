@@ -174,6 +174,7 @@ def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=10,
         return [], 0
 
 
+
 def process_grid_roads(grid):
     """Process road network for a grid cell with feature engineering"""
 
@@ -216,53 +217,68 @@ def process_grid_roads(grid):
 
         # Identify junctions
         data['is_junction'] = (G.degree(u) > 2 or G.degree(v) > 2)
-    print("1")
+
     return G
 
 
 def create_gnn_data(G, grid_features):
-    """Convert OSMnx graph to PyG Data format with enhanced features"""
-    # Extract the first element from the list
-    grid_data = grid_features[0]['features']
-
-    print("grid_features:", grid_data)  # Debug print
-
     # Node features: [latitude, longitude, degree]
     nodes = []
-    for node in G.nodes():
+    node_id_to_index = {}  # Mapping from node ID to index
+    for idx, node in enumerate(G.nodes()):
         n_data = G.nodes[node]
         nodes.append([n_data['y'], n_data['x'], G.degree(node)])
+        node_id_to_index[node] = idx
 
     # Edge features: [road_type, length, curvature, is_junction]
     edges = []
     edge_indices = []
     for u, v, data in G.edges(data=True):
         edges.append([
-            data['road_type'],
-            data['length'],
-            data['curvature'],
-            int(data['is_junction'])
+            data.get('road_type', 0),
+            data.get('length', 0),
+            data.get('curvature', 0),
+            int(data.get('is_junction', 0))
         ])
         edge_indices.append([u, v])
 
-    # Ensure grid_features is a dictionary and access each feature by key
-    grid_data_tensor = torch.tensor(grid_data['grid_data']).float()
-    poi_score = torch.tensor(grid_data['poi_score']).float()
-    density_rank = torch.tensor(grid_data['density_rank']).float()
-    temperature = torch.tensor(grid_data['temp']).float()
-    rain = torch.tensor(grid_data['rain']).float()
+    # Convert grid features to tensors
+    grid_data_values = [
+        grid_features['grid_data']['min_lat'],
+        grid_features['grid_data']['max_lat'],
+        grid_features['grid_data']['min_lon'],
+        grid_features['grid_data']['max_lon'],
+        grid_features['grid_data']['density_rank']
+    ]
+    grid_data = torch.tensor(grid_data_values, dtype=torch.float32)
+    poi_score = torch.tensor([grid_features['poi_score']], dtype=torch.float32)
+    density_rank = torch.tensor([grid_features['density_rank']], dtype=torch.float32)
+    temperature = torch.tensor([grid_features['temp']], dtype=torch.float32)
+    # Convert Boolean to float: 1.0 if raining, 0.0 otherwise.
+    rain = torch.tensor([1.0 if grid_features['rain'] else 0.0], dtype=torch.float32)
 
-    # Concatenate the grid features into one tensor
-    grid_feature_tensor = torch.cat([grid_data_tensor, poi_score, density_rank, temperature, rain], dim=-1)
+    grid_feature_tensor = torch.cat([grid_data, poi_score, density_rank, temperature, rain], dim=-1)
 
-    # Add grid features to edge features
-    edge_features = [torch.cat([torch.tensor(e), grid_feature_tensor]) for e in edges]
+    if len(edges) == 0:
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+        edge_attr = torch.empty((0, 4 + grid_feature_tensor.numel()))
+    else:
+        edge_features = [
+            torch.cat([torch.tensor(e, dtype=torch.float32), grid_feature_tensor])
+            for e in edges
+        ]
+        edge_attr = torch.stack(edge_features)
+        edge_index = torch.tensor(edge_indices, dtype=torch.long).t().contiguous()
 
-    return Data(
-        x=torch.tensor(nodes).float(),
-        edge_index=torch.tensor(edge_indices).t().contiguous(),
-        edge_attr=torch.stack(edge_features)
+    data_obj = Data(
+        x=torch.tensor(nodes, dtype=torch.float32),
+        edge_index=edge_index,
+        edge_attr=edge_attr
     )
+    # Store the mapping in the Data object for later use
+    data_obj.node_id_to_index = node_id_to_index
+    return data_obj
+
 
 
 class BusStopGNN(torch.nn.Module):
@@ -336,48 +352,51 @@ def predict_new_stops(model, grid):
 
     return sorted(candidates, key=lambda x: -x['probability'])
 
-
 def main():
     city_grid_data = read_city_grid(city_grid_file)
     stib_stops_data = read_stib_stops(stib_stops_file)
     poi_names, poi_ranks = read_poi_tags(poi_tags_file)
-    # Create a mapping from POI tag names to rank values.
     tag_rank_mapping = dict(zip(poi_names, poi_ranks))
     temperature, is_raining = get_weather(city_name, date_time)
 
-    feature_data = []
-
     # Initialize the model once
-    model = BusStopGNN(num_features=3)  # Adjust num_features as needed
+    model = BusStopGNN(num_features=3)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
     for _, grid in city_grid_data.iterrows():
-        pois, poi_count = get_pois(grid["min_lat"],grid["min_lon"],grid["max_lat"],grid["max_lon"], 'amenity', tag_rank_mapping=tag_rank_mapping)
+        pois, poi_count = get_pois(
+            grid["min_lat"], grid["min_lon"], grid["max_lat"], grid["max_lon"], 'amenity',
+            tag_rank_mapping=tag_rank_mapping
+        )
         graph = process_grid_roads(grid)
-        feature_data.append({
-            'graph': graph,
-            'features': {
-                'grid_data': grid,
-                'poi_score': poi_count,
-                'density_rank': grid['density_rank'],
-                'temp': temperature,
-                'rain': is_raining
-            }
-        })
-        # Create graph data for the GNN
-        data = create_gnn_data(graph, feature_data)
 
-        # Generate labels (1 if near existing stop)
+        current_features = {
+            'grid_data': grid,
+            'poi_score': poi_count,
+            'density_rank': grid['density_rank'],
+            'temp': temperature,
+            'rain': is_raining
+        }
+
+        data = create_gnn_data(graph, current_features)
+
+        # Create labels tensor
         labels = torch.zeros(data.x.size(0))
+        node_mapping = data.node_id_to_index  # The mapping from node IDs to tensor indices
+
         for _, stop in stib_stops_data.iterrows():
             nearest_node = ox.distance.nearest_nodes(
                 graph,
                 X=stop['stop_lon'],
                 Y=stop['stop_lat']
             )
-            labels[nearest_node] = 1
+            # Only update if the nearest_node is in the mapping
+            if nearest_node in node_mapping:
+                labels[node_mapping[nearest_node]] = 1
+            else:
+                print(f"Warning: Nearest node {nearest_node} not found in node mapping.")
 
-        # Train the model on this grid's data
+        # Train on this grid's data
         model.train()
         optimizer.zero_grad()
         pred = model(data).squeeze()
@@ -385,9 +404,9 @@ def main():
         loss.backward()
         optimizer.step()
 
-        # Predict new stops in this grid
+        # Predict new stops in this grid (assuming predict_new_stops uses similar logic)
         model.eval()
-        new_stops = predict_new_stops(model, {'graph': graph, 'features': feature_data})
+        new_stops = predict_new_stops(model, {'graph': graph, 'features': current_features})
         print(f"Predicted {len(new_stops)} new bus stops in grid:")
         for stop in new_stops:
             print(f"  → {stop['lat']:.6f}, {stop['lon']:.6f} (score: {stop['probability']:.2f})")
@@ -406,14 +425,12 @@ def main():
     print(stib_stops_data.head())
 
     print("POI Names:")
-    print(poi_names[:5])  # Print first 5 names
+    print(poi_names[:5])
 
     print("\nPOI Ranks:")
     print(poi_ranks[:5])
 
 if __name__ == "__main__":
-        main()
+    main()
 
-        if __name__ == "__main__":
-            main()
 
