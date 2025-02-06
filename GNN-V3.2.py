@@ -306,26 +306,48 @@ def main():
     temperature, is_raining = get_weather(city_name, date_time)
 
     feature_data = []
+
+    # Initialize the model once
+    model = BusStopGNN(num_features=3)  # Adjust num_features as needed
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
     for _, grid in city_grid_data.iterrows():
-        poi_count = get_pois(grid["min_lat"],grid["min_lon"],grid["max_lat"],grid["max_lon"], 'amenity', tag_rank_mapping=tag_rank_mapping)
+        pois, poi_count = get_pois(grid["min_lat"],grid["min_lon"],grid["max_lat"],grid["max_lon"], 'amenity', tag_rank_mapping=tag_rank_mapping)
         graph = process_grid_roads(grid)
         feature_data.append({
             'graph': graph,
             'features': {
                 'grid_data': grid,
-                'poi_score': poi_count[1],
+                'poi_score': poi_count,
                 'density_rank': grid['density_rank'],
                 'temp': temperature,
                 'rain': is_raining
             }
         })
+        # Create graph data for the GNN
+        data = create_gnn_data(graph, feature_data)
 
-    # Train the model and get the trained instance
-    trained_model = train_model(feature_data, stib_stops_data)
+        # Generate labels (1 if near existing stop)
+        labels = torch.zeros(data.x.size(0))
+        for _, stop in stib_stops_data.iterrows():
+            nearest_node = ox.distance.nearest_nodes(
+                graph,
+                X=stop['stop_lon'],
+                Y=stop['stop_lat']
+            )
+            labels[nearest_node] = 1
 
-    # Predict for each grid using the trained model
-    for grid in feature_data:
-        new_stops = predict_new_stops(trained_model, grid)
+        # Train the model on this grid's data
+        model.train()
+        optimizer.zero_grad()
+        pred = model(data).squeeze()
+        loss = F.binary_cross_entropy(pred, labels)
+        loss.backward()
+        optimizer.step()
+
+        # Predict new stops in this grid
+        model.eval()
+        new_stops = predict_new_stops(model, {'graph': graph, 'features': feature_data})
         print(f"Predicted {len(new_stops)} new bus stops in grid:")
         for stop in new_stops:
             print(f"  → {stop['lat']:.6f}, {stop['lon']:.6f} (score: {stop['probability']:.2f})")
@@ -350,5 +372,8 @@ def main():
     print(poi_ranks[:5])
 
 if __name__ == "__main__":
-    main()
+        main()
+
+        if __name__ == "__main__":
+            main()
 
