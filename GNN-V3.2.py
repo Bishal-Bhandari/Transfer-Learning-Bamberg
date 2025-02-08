@@ -209,10 +209,10 @@ def extract_grid_features(grid, pois_count, temperature, is_raining):
 
 
 def download_road_network(grid):
-    print(grid)
     # Download road network using bounding box
-    G = ox.graph_from_bbox((grid[0], grid[1], grid[2], grid[3]), network_type="drive")
-    print(G)
+    G = ox.graph_from_bbox((grid["min_lat"], grid["min_lon"],
+                            grid["max_lat"], grid["max_lon"]),
+                           network_type="drive")
     return G
 
 def construct_road_graph(road_, bus_stops):
@@ -266,21 +266,21 @@ def main():
     poi_names, poi_ranks = read_poi_tags(poi_tags_file)
     tag_rank_mapping = dict(zip(poi_names, poi_ranks))
     temperature, is_raining = get_weather(city_name, date_time)
-    road_ = download_road_network(city_name)
-    road_graph = construct_road_graph(road_, stib_stops_data)
+    # road_graph = construct_road_graph(road_, stib_stops_data)
 
 
 
 
     for _, grid in city_grid_data.iterrows():
+        print(grid)
         pois, poi_count = get_pois(
             grid["min_lat"], grid["min_lon"], grid["max_lat"], grid["max_lon"], 'amenity',
             tag_rank_mapping=tag_rank_mapping)
+
         road_ = download_road_network(grid)
 
         features = extract_grid_features(grid, poi_count, temperature, is_raining)
 
-        print(road_graph)
         print(f"road{road_}")
 
         print("Extracted Grid Features:")
