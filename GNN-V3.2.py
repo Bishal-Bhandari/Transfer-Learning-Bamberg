@@ -240,38 +240,6 @@ def construct_road_graph(road_, bus_stops):
     return road_graph
 
 
-# class BusStopGNN(torch.nn.Module):
-#     def __init__(self, input_dim, hidden_dim, output_dim):
-#         super(BusStopGNN, self).__init__()
-#         self.conv1 = GCNConv(input_dim, hidden_dim)
-#         self.conv2 = GCNConv(hidden_dim, output_dim)
-#
-#     def forward(self, data):
-#         x, edge_index = data.x, data.edge_index
-#         x = self.conv1(x, edge_index)
-#         x = f.relu(x)
-#         x = self.conv2(x, edge_index)
-#         return f.log_softmax(x, dim=1)
-#
-# def train_gnn_model(data, input_dim, hidden_dim, output_dim, num_epochs=200, learning_rate=0.01):
-#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-#     model = BusStopGNN(input_dim, hidden_dim, output_dim).to(device)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-#     data = data.to(device)
-#
-#     for epoch in range(num_epochs):
-#         model.train()
-#         optimizer.zero_grad()
-#         out = model(data)
-#         loss = f.nll_loss(out[data.train_mask], data.y[data.train_mask])
-#         loss.backward()
-#         optimizer.step()
-#
-#         if epoch % 10 == 0:
-#             print(f'Epoch {epoch}, Loss: {loss.item():.4f}')
-#
-#     return model
-
 
 def main():
     global features
@@ -282,8 +250,7 @@ def main():
     temperature, is_raining = get_weather(city_name, date_time)
     road_ = download_road_network(city_name)
     road_graph = construct_road_graph(road_, stib_stops_data)
-    print(road_graph)
-    print(f"road{road_}")
+
 
 
 
@@ -304,6 +271,8 @@ def main():
     print("Extracted Grid Features:")
     print(features)
 
+    print(f"Graph {road_graph}")
+    print(f"Road {road_}")
 
     if temperature is not None:
         print(f"\nWeather in {city_name} on {date_time}:")
