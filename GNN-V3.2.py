@@ -8,15 +8,20 @@ from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv
 import torch.nn.functional as f
 import osmnx as ox
+import os
+import networkx as nx
+from torch_geometric.utils import from_networkx
 
 with open('api_keys.json') as json_file:
     api_keys = json.load(json_file)
-
 # API key
 API_KEY = api_keys['Weather_API']['API_key']
 
+# Ensure reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+
 # User input
-# Example usage
 city_name = "Brussels"
 date_time = "2025-02-07 14:00"  # date and time
 city_grid_file = "Training Data/city_grid_density.ods"
@@ -124,7 +129,7 @@ def aggregate_poi_ranks(pois, tag_rank_mapping, tag_key='amenity'):
     return total_rank
 
 
-def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=10, tag_rank_mapping=None):
+def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=100, tag_rank_mapping=None):
     # the filter is applied on the same key as poi_type.
     query = f"""
     [out:json];
@@ -173,22 +178,121 @@ def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=10,
         return [], 0
 
 
+def extract_grid_features(grid, pois_count, temperature, is_raining):
+
+    # Extract density rank from grid data.
+    # Use .get() to allow flexibility if grid is a dict; if it's a pd.Series, you could also use grid["density_rank"].
+    density_rank = grid.get("density_rank", 0)
+
+    # Construct grid_data with geographic boundaries and density rank.
+    grid_data = {
+        "min_lat": grid.get("min_lat"),
+        "max_lat": grid.get("max_lat"),
+        "min_lon": grid.get("min_lon"),
+        "max_lon": grid.get("max_lon"),
+        "density_rank": density_rank,
+    }
+    if is_raining:
+        rain_val = 1
+    else:
+        rain_val=0
+    # Combine all features into a single dictionary.
+    grid_features = {
+        "grid_data": grid_data,
+        "poi_score": pois_count,
+        "density_rank": density_rank,
+        "temp": temperature,
+        "rain": rain_val
+    }
+
+    return grid_features
+
+
+def download_road_network(grid):
+    print(grid)
+    # Download road network using bounding box
+    G = ox.graph_from_bbox((grid[0], grid[1], grid[2], grid[3]), network_type="drive")
+    print(G)
+    return G
+
+def construct_road_graph(road_, bus_stops):
+    road_graph = nx.Graph()
+    for node, data in road_.nodes(data=True):
+        road_graph.add_node(node, **data)
+    for u, v, data in road_.edges(data=True):
+        road_graph.add_edge(u, v, **data)
+    for idx, row in bus_stops.iterrows():
+        road_graph.add_node(f'bus_stop_{idx}', y=row['stop_lat'], x=row['stop_lon'], stop_name=row['stop_name'])
+    return road_graph
+
+
+# class BusStopGNN(torch.nn.Module):
+#     def __init__(self, input_dim, hidden_dim, output_dim):
+#         super(BusStopGNN, self).__init__()
+#         self.conv1 = GCNConv(input_dim, hidden_dim)
+#         self.conv2 = GCNConv(hidden_dim, output_dim)
+#
+#     def forward(self, data):
+#         x, edge_index = data.x, data.edge_index
+#         x = self.conv1(x, edge_index)
+#         x = f.relu(x)
+#         x = self.conv2(x, edge_index)
+#         return f.log_softmax(x, dim=1)
+#
+# def train_gnn_model(data, input_dim, hidden_dim, output_dim, num_epochs=200, learning_rate=0.01):
+#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#     model = BusStopGNN(input_dim, hidden_dim, output_dim).to(device)
+#     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+#     data = data.to(device)
+#
+#     for epoch in range(num_epochs):
+#         model.train()
+#         optimizer.zero_grad()
+#         out = model(data)
+#         loss = f.nll_loss(out[data.train_mask], data.y[data.train_mask])
+#         loss.backward()
+#         optimizer.step()
+#
+#         if epoch % 10 == 0:
+#             print(f'Epoch {epoch}, Loss: {loss.item():.4f}')
+#
+#     return model
+
 
 def main():
+    global features
     city_grid_data = read_city_grid(city_grid_file)
     stib_stops_data = read_stib_stops(stib_stops_file)
     poi_names, poi_ranks = read_poi_tags(poi_tags_file)
     tag_rank_mapping = dict(zip(poi_names, poi_ranks))
     temperature, is_raining = get_weather(city_name, date_time)
+    road_ = download_road_network(city_name)
+    road_graph = construct_road_graph(road_, stib_stops_data)
+
+
 
 
     for _, grid in city_grid_data.iterrows():
         pois, poi_count = get_pois(
             grid["min_lat"], grid["min_lon"], grid["max_lat"], grid["max_lon"], 'amenity',
             tag_rank_mapping=tag_rank_mapping)
-        print(poi_count)
+        road_ = download_road_network(grid)
 
+        features = extract_grid_features(grid, poi_count, temperature, is_raining)
 
+        print(road_graph)
+        print(f"road{road_}")
+
+        print("Extracted Grid Features:")
+        print(features)
+        # Convert to PyTorch Geometric format
+        # data = from_networkx(road_graph)
+        # data.x = torch.randn((data.num_nodes, 5))  # Placeholder feature matrix
+        # data.y = torch.randint(0, 2, (data.num_nodes,))  # Placeholder labels
+        # data.train_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+        # data.train_mask[:int(0.8 * data.num_nodes)] = True  # Train/Test split
+        #
+        # model = train_gnn_model(data, input_dim=5, hidden_dim=16, output_dim=2)
 
 
 
