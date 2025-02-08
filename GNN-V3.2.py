@@ -11,6 +11,10 @@ import osmnx as ox
 import os
 import networkx as nx
 from torch_geometric.utils import from_networkx
+import networkx as nx
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+import joblib
 
 with open('api_keys.json') as json_file:
     api_keys = json.load(json_file)
@@ -240,6 +244,53 @@ def construct_road_graph(road_, bus_stops):
     return road_graph
 
 
+def prepare_data(road_graph, stib_stops_data):
+    # Initialize lists to store features and labels
+    features = []
+    labels = []
+
+    # Iterate over each node in the road graph
+    for node, data in road_graph.nodes(data=True):
+        # Extract features: e.g., degree of the node (number of connected edges)
+        degree = data.get('degree', 0)
+        # Add more features as needed
+
+        # Check if the node corresponds to a bus stop
+        is_bus_stop = 1 if node in stib_stops_data['stop_name'].values else 0
+
+        # Append features and label
+        features.append([degree])  # Add more features here
+        labels.append(is_bus_stop)
+
+    # Convert to DataFrame for easier handling
+    features_df = pd.DataFrame(features, columns=['degree'])  # Add more feature names
+    labels_df = pd.DataFrame(labels, columns=['is_bus_stop'])
+
+    # Combine features and labels into a single DataFrame
+    data = pd.concat([features_df, labels_df], axis=1)
+    return data
+
+def train_model(data):
+    # Split data into features and labels
+    X = data.drop('is_bus_stop', axis=1)
+    y = data['is_bus_stop']
+
+    # Split into training and testing sets
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # Initialize the model
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+
+    # Train the model
+    model.fit(X_train, y_train)
+
+    # Evaluate the model
+    accuracy = model.score(X_test, y_test)
+    print(f'Model Accuracy: {accuracy:.2f}')
+
+    # Save the trained model
+    joblib.dump(model, 'bus_stop_predictor.pkl')
+
 
 def main():
     global features
@@ -248,10 +299,12 @@ def main():
     poi_names, poi_ranks = read_poi_tags(poi_tags_file)
     tag_rank_mapping = dict(zip(poi_names, poi_ranks))
     temperature, is_raining = get_weather(city_name, date_time)
+
     road_ = download_road_network(city_name)
     road_graph = construct_road_graph(road_, stib_stops_data)
 
-
+    data = prepare_data(road_graph, stib_stops_data)
+    train_model(data)
 
 
     for _, grid in city_grid_data.iterrows():
@@ -259,14 +312,8 @@ def main():
             grid["min_lat"], grid["min_lon"], grid["max_lat"], grid["max_lon"], 'amenity',
             tag_rank_mapping=tag_rank_mapping)
         features = extract_grid_features(grid, poi_count, temperature, is_raining)
-        # Convert to PyTorch Geometric format
-        # data = from_networkx(road_graph)
-        # data.x = torch.randn((data.num_nodes, 5))  # Placeholder feature matrix
-        # data.y = torch.randint(0, 2, (data.num_nodes,))  # Placeholder labels
-        # data.train_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
-        # data.train_mask[:int(0.8 * data.num_nodes)] = True  # Train/Test split
-        #
-        # model = train_gnn_model(data, input_dim=5, hidden_dim=16, output_dim=2)
+
+
 
     print("Extracted Grid Features:")
     print(features)
