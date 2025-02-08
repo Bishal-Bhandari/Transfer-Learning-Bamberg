@@ -208,12 +208,26 @@ def extract_grid_features(grid, pois_count, temperature, is_raining):
     return grid_features
 
 
-def download_road_network(grid):
-    # Download road network using bounding box
-    G = ox.graph_from_bbox((grid["min_lat"], grid["min_lon"],
-                            grid["max_lat"], grid["max_lon"]),
-                           network_type="drive")
-    return G
+def download_road_network(place_name):
+    print(f"Downloading road network data for {place_name}...")
+
+    graph_ = ox.graph_from_place(city_name, network_type='all')
+
+    # Get the bounding box of the city
+    nodes = ox.graph_to_gdfs(graph_, nodes=True, edges=False)
+    north, south, east, west = nodes.unary_union.bounds
+    radius = 0.01
+    # Expand the bounding box
+    expanded_north = north + radius
+    expanded_south = south - radius
+    expanded_east = east + radius
+    expanded_west = west - radius
+
+    # Download the expanded graph
+    expanded_graph_ = ox.graph_from_bbox((expanded_north, expanded_south, expanded_east, expanded_west), network_type='all')
+
+    return expanded_graph_
+
 
 def construct_road_graph(road_, bus_stops):
     road_graph = nx.Graph()
@@ -266,25 +280,18 @@ def main():
     poi_names, poi_ranks = read_poi_tags(poi_tags_file)
     tag_rank_mapping = dict(zip(poi_names, poi_ranks))
     temperature, is_raining = get_weather(city_name, date_time)
-    # road_graph = construct_road_graph(road_, stib_stops_data)
-
+    road_ = download_road_network(city_name)
+    road_graph = construct_road_graph(road_, stib_stops_data)
+    print(road_graph)
+    print(f"road{road_}")
 
 
 
     for _, grid in city_grid_data.iterrows():
-        print(grid)
         pois, poi_count = get_pois(
             grid["min_lat"], grid["min_lon"], grid["max_lat"], grid["max_lon"], 'amenity',
             tag_rank_mapping=tag_rank_mapping)
-
-        road_ = download_road_network(grid)
-
         features = extract_grid_features(grid, poi_count, temperature, is_raining)
-
-        print(f"road{road_}")
-
-        print("Extracted Grid Features:")
-        print(features)
         # Convert to PyTorch Geometric format
         # data = from_networkx(road_graph)
         # data.x = torch.randn((data.num_nodes, 5))  # Placeholder feature matrix
@@ -294,7 +301,8 @@ def main():
         #
         # model = train_gnn_model(data, input_dim=5, hidden_dim=16, output_dim=2)
 
-
+    print("Extracted Grid Features:")
+    print(features)
 
 
     if temperature is not None:
