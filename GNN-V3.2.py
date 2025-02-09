@@ -15,6 +15,8 @@ import networkx as nx
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 import joblib
+import learn_based as lb
+
 
 with open('api_keys.json') as json_file:
     api_keys = json.load(json_file)
@@ -219,7 +221,7 @@ def download_road_network(place_name):
 
     # Get the bounding box of the city
     nodes = ox.graph_to_gdfs(graph_, nodes=True, edges=False)
-    north, south, east, west = nodes.unary_union.bounds
+    north, south, east, west = nodes.union_all().bounds
     radius = 0.01
     # Expand the bounding box
     expanded_north = north + radius
@@ -306,6 +308,8 @@ def main():
     data = prepare_data(road_graph, stib_stops_data)
     train_model(data)
 
+    # Call function to train with existing stops
+    lb.train_and_save_model(stib_stops_data,road_graph)
 
     for _, grid in city_grid_data.iterrows():
         pois, poi_count = get_pois(
