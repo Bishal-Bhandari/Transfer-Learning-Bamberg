@@ -272,6 +272,7 @@ def prepare_data(road_graph, stib_stops_data):
     data = pd.concat([features_df, labels_df], axis=1)
     return data
 
+
 def train_model(data):
     # Split data into features and labels
     X = data.drop('is_bus_stop', axis=1)
@@ -306,10 +307,9 @@ def main():
     road_graph = construct_road_graph(road_, stib_stops_data)
 
     data = prepare_data(road_graph, stib_stops_data)
-    train_model(data)
 
     # Call function to train with existing stops
-    lb.train_and_save_model(stib_stops_data,road_graph)
+    train_model(data)
 
     for _, grid in city_grid_data.iterrows():
         pois, poi_count = get_pois(
