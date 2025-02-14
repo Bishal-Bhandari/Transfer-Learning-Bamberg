@@ -1,139 +1,45 @@
-import pandas as pd
-import numpy as np
 import torch
 import torch.nn.functional as F
+from OSMPythonTools import data as osmp_data  # renamed to avoid conflict
 from torch_geometric.nn import GCNConv
 from torch_geometric.data import Data
-import networkx as nx
-import osmnx as ox
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from geopy.distance import great_circle
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import KMeans
 import joblib
 
-
-# --------------------------
-# 1. Load Bus Stop Data
-# --------------------------
-def load_bus_stops(ods_path):
-    df = pd.read_excel(ods_path, engine='odf')
-    print(f"Loaded {len(df)} bus stops")
-    return df[['stop_name', 'stop_lat', 'stop_lon']]
-
-
-# --------------------------
-# 2. Road Network Integration
-# --------------------------
-def get_road_network(stops, city_name):
-    # Download road network with modern parameters
-    G = ox.graph_from_place(
-        city_name,
-        network_type="drive",
-        simplify=False,
-        truncate_by_edge=True
-    )
-
-    # Project to UTM
-    G_proj = ox.project_graph(G)
-
-    # Integrate stops using updated method
-    for _, stop in stops.iterrows():
-        point = (stop['stop_lat'], stop['stop_lon'])
-        nearest_edge = ox.distance.nearest_edges(G_proj, stops['stop_lon'], stops['stop_lat'])
-
-        # Use correct edge insertion syntax
-        G_proj = ox.utils_graph.insert_node_along_edge(
-            G_proj,
-            nearest_edge,
-            new_node_id=f"stop_{stop['stop_name']}",
-            point=point
-        )
-
-    return G_proj
-
-
-# --------------------------
-# 3. Feature Engineering
-# --------------------------
-def create_features(road_network):
-    features = []
-    road_types = []
-
-    # Get road type for each bus stop
-    for node, data in road_network.nodes(data=True):
-        if 'is_stop' in data:
-            # Get connected edge properties
-            edges = list(road_network.edges(node, data=True))
-            if edges:
-                road_type = edges[0][-1].get('highway', 'unknown')
-                if isinstance(road_type, list):
-                    road_type = road_type[0]
-            else:
-                road_type = 'unknown'
-
-            features.append([
-                data['y'],  # lat
-                data['x'],  # lon
-                road_type
-            ])
-
-    # Encode road types
-    le = LabelEncoder()
-    df = pd.DataFrame(features, columns=['lat', 'lon', 'road_type'])
-    df['road_type_encoded'] = le.fit_transform(df['road_type'])
+# 1. Data Preparation
+def prepare_data(stop_data):
+    """Process raw bus stop data into graph format and generate labels using clustering."""
+    # Use only coordinates as features
+    features = stop_data[['stop_lat', 'stop_lon']].values
 
     # Normalize coordinates
     scaler = StandardScaler()
-    scaled_features = scaler.fit_transform(df[['lat', 'lon', 'road_type_encoded']])
+    features_scaled = scaler.fit_transform(features)
 
-    return scaled_features, scaler, le
+    # Create graph edges based on spatial proximity
+    nn_model = NearestNeighbors(n_neighbors=3).fit(features_scaled)
+    distances, indices = nn_model.kneighbors(features_scaled)
 
+    # Create edge index (each stop connects to its 2 nearest neighbors; avoid self-loops)
+    edge_list = []
+    for i, neighbors in enumerate(indices):
+        for j in neighbors:
+            if i != j:
+                edge_list.append([i, j])
+    edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
 
-# --------------------------
-# 4. Graph Construction
-# --------------------------
-def build_bus_graph(road_network, features):
-    G = nx.Graph()
+    # Generate meaningful labels using KMeans clustering
+    # Here, we assume 2 clusters (for a binary classification). Change n_clusters if needed.
+    kmeans = KMeans(n_clusters=2, random_state=42)
+    labels = kmeans.fit_predict(features_scaled)
 
-    # Add nodes with features
-    stops = [n for n, d in road_network.nodes(data=True) if 'is_stop' in d]
-    for i, node in enumerate(stops):
-        G.add_node(node, features=features[i])
+    return features_scaled, edge_index, scaler, labels
 
-    # Connect stops using multiple strategies
-    for i, node1 in enumerate(stops):
-        for j, node2 in enumerate(stops[i + 1:]):
-            try:
-                # Strategy 1: Use road network path
-                path = nx.shortest_path(road_network, node1, node2, weight='length')
-                if len(path) <= 3:
-                    G.add_edge(node1, node2, weight=1 / (len(path) - 1))
-            except nx.NetworkXNoPath:
-                try:
-                    # Strategy 2: Use geographic distance as fallback
-                    coord1 = (road_network.nodes[node1]['y'], road_network.nodes[node1]['x'])
-                    coord2 = (road_network.nodes[node2]['y'], road_network.nodes[node2]['x'])
-                    distance = great_circle(coord1, coord2).meters
-
-                    # Connect if within 1.5km and same road type
-                    if distance < 1500:
-                        road_type1 = road_network.nodes[node1].get('highway', 'unknown')
-                        road_type2 = road_network.nodes[node2].get('highway', 'unknown')
-                        if road_type1 == road_type2:
-                            G.add_edge(node1, node2, weight=1 / (distance + 1e-5))
-                except KeyError:
-                    # Strategy 3: Add weak connection for complete graph
-                    G.add_edge(node1, node2, weight=0.1)
-                    continue
-
-    # Remove isolated nodes
-    G.remove_nodes_from(list(nx.isolates(G)))
-
-    return G
-
-
-# --------------------------
-# 5. GNN Model
-# --------------------------
+# 2. GNN Model Architecture
 class BusStopGNN(torch.nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
         super().__init__()
@@ -148,84 +54,106 @@ class BusStopGNN(torch.nn.Module):
         x = F.relu(self.conv2(x, edge_index))
         return self.predictor(x)
 
-
-# --------------------------
-# 6. Training Pipeline
-# --------------------------
-def train_model(graph, num_classes=2, epochs=200):
+# 3. Training Pipeline
+def train_model(features, edge_index, labels, num_epochs=1000):
     # Convert to PyG Data
-    edge_index = torch.tensor(list(graph.edges()), dtype=torch.long).t().contiguous()
-    x = torch.tensor([graph.nodes[n]['features'] for n in graph.nodes], dtype=torch.float)
+    graph_data = Data(
+        x=torch.tensor(features, dtype=torch.float),
+        edge_index=edge_index,
+        y=torch.tensor(labels, dtype=torch.long)
+    )
 
-    # Create synthetic labels (example: predict if major transportation hub)
-    labels = torch.tensor([int("station" in n.lower()) for n in graph.nodes], dtype=torch.long)
-
-    data = Data(x=x, y=labels, edge_index=edge_index)
-    data.train_mask = torch.zeros(len(x), dtype=torch.bool).bernoulli(0.8)
-    data.val_mask = ~data.train_mask
+    # Create train/validation masks (80/20 split)
+    num_nodes = len(features)
+    mask = torch.rand(num_nodes) < 0.8
+    graph_data.train_mask = mask
+    graph_data.val_mask = ~mask
 
     # Initialize model
-    model = BusStopGNN(input_dim=x.shape[1],
-                       hidden_dim=32,
-                       output_dim=num_classes)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.005)
+    model = BusStopGNN(
+        input_dim=features.shape[1],
+        hidden_dim=32,
+        output_dim=2  # Two clusters/classes
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
-    # Training loop
     best_acc = 0
-    for epoch in range(epochs):
+    for epoch in range(num_epochs):
         model.train()
         optimizer.zero_grad()
-        out = model(data)
-        loss = F.cross_entropy(out[data.train_mask], data.y[data.train_mask])
+        out = model(graph_data)
+        loss = F.cross_entropy(out[graph_data.train_mask], graph_data.y[graph_data.train_mask])
         loss.backward()
         optimizer.step()
 
         # Validation
         model.eval()
         with torch.no_grad():
-            pred = model(data).argmax(dim=1)
-            acc = (pred[data.val_mask] == data.y[data.val_mask]).sum().item() / data.val_mask.sum().item()
+            pred = out.argmax(dim=1)
+            correct = (pred[graph_data.val_mask] == graph_data.y[graph_data.val_mask]).sum().item()
+            acc = correct / graph_data.val_mask.sum().item()
 
         if acc > best_acc:
             best_acc = acc
-            torch.save(model.state_dict(), 'best_model.pth')
+            torch.save(model.state_dict(), 'Output/best_bus_stop_model.pth')
 
         if epoch % 20 == 0:
             print(f'Epoch {epoch:03d} | Loss: {loss:.4f} | Val Acc: {acc:.4f}')
 
-    return model
+    return model, graph_data
 
+# 4. Prediction Function
+def predict_new_stop(new_coords, graph_data, model_path='Output/best_bus_stop_model.pth'):
+    # Load the trained model and scaler
+    model = BusStopGNN(input_dim=2, hidden_dim=32, output_dim=2)
+    model.load_state_dict(torch.load(model_path))
+    scaler = joblib.load('Output/bus_stop_scaler.pkl')
 
-# --------------------------
-# 7. Main Execution
-# --------------------------
-def main(ods_path, city_name):
-    # 1. Load data
-    stops = load_bus_stops(ods_path)
+    # Preprocess new data
+    scaled_coords = scaler.transform([new_coords])
+    new_x = torch.tensor(scaled_coords, dtype=torch.float)
 
-    # 2. Get integrated road network
-    road_network = get_road_network(stops, city_name)
+    # Create prediction data by connecting the new stop to existing stops
+    full_features = torch.cat([graph_data.x, new_x])
+    nn_model = NearestNeighbors(n_neighbors=3).fit(graph_data.x.numpy())
+    _, indices = nn_model.kneighbors(new_x.numpy())
 
-    # 3. Create features
-    features, scaler, le = create_features(road_network)
+    new_edges = []
+    new_node_idx = len(full_features) - 1
+    for idx in indices[0]:
+        new_edges.append([new_node_idx, idx])
+        new_edges.append([idx, new_node_idx])
+    new_edges_tensor = torch.tensor(new_edges, dtype=torch.long).t().contiguous()
 
-    # 4. Build bus stop graph
-    bus_graph = build_bus_graph(road_network, features)
+    pred_edge_index = torch.cat([graph_data.edge_index, new_edges_tensor], dim=1)
+    pred_data = Data(x=full_features, edge_index=pred_edge_index)
 
-    # 5. Train model
-    model = train_model(bus_graph)
+    # Make prediction
+    model.eval()
+    with torch.no_grad():
+        logits = model(pred_data)
+        # The new node is the last one
+        prob = F.softmax(logits[-1], dim=0)
+        predicted_label = int(prob.argmax())
 
-    # 6. Save artifacts
-    joblib.dump(scaler, 'bus_scaler.pkl')
-    joblib.dump(le, 'label_encoder.pkl')
-    nx.write_gpickle(bus_graph, 'bus_graph.gpickle')
-    print("\nTraining complete. Saved:")
-    print("- Trained model (best_model.pth)")
-    print("- Feature scaler (bus_scaler.pkl)")
-    print("- Label encoder (label_encoder.pkl)")
-    print("- Bus stop graph (bus_graph.gpickle)")
+    return predicted_label, prob.numpy()
 
-
+# 5. Main Execution Flow
 if __name__ == "__main__":
-    # Example usage
-    main('Training Data/stib_stops.ods', 'Brussels, Belgium')
+    # Load your bus stop data
+    bus_stops = pd.read_excel("Training Data/stib_stops.ods", engine='odf')  # Replace with your data source
+
+    # Prepare data and generate labels via clustering
+    features, edge_index, scaler, labels = prepare_data(bus_stops)
+
+    # Save preprocessing artifacts
+    joblib.dump(scaler, 'Output/bus_stop_scaler.pkl')
+
+    # Train model and capture graph_data
+    trained_model, graph_data = train_model(features, edge_index, labels)
+
+    # Example prediction with a new bus stop coordinate (Brussels)
+    new_stop = [50.8503, 4.3517]
+    predicted_label, prediction_prob = predict_new_stop(new_stop, graph_data)
+    print(f"Prediction probabilities: {prediction_prob}")
+    print(f"Predicted cluster label for the new stop: {predicted_label}")
