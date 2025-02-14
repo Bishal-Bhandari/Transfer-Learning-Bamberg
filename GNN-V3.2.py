@@ -18,6 +18,9 @@ import torch.nn.functional as F
 from sklearn.preprocessing import StandardScaler
 from shapely.geometry import Polygon
 import geopandas as gpd
+from torch_geometric.utils import from_networkx
+import momepy
+import geopandas as gpd
 
 # Load API keys
 with open('api_keys.json') as json_file:
@@ -219,80 +222,20 @@ def extract_grid_features(grid, pois_count, temperature, is_raining):
     return grid_features
 
 
-
 def download_road_network(place_name):
     print(f"Downloading road network data for {place_name}...")
 
     graph_ = ox.graph_from_place(place_name, network_type='drive')
 
-    # Get the bounding box of the city
-    nodes = ox.graph_to_gdfs(graph_, nodes=True, edges=False)
-    north, south, east, west = nodes.union_all().bounds
-    radius = 0.01
-    # Expand the bounding box
-    expanded_north = north + radius
-    expanded_south = south - radius
-    expanded_east = east + radius
-    expanded_west = west - radius
+    # Ensure the road network is connected
+    if not nx.is_connected(graph_.to_undirected()):
+        largest_component = max(nx.connected_components(graph_.to_undirected()), key=len)
+        graph_ = graph_.subgraph(largest_component).copy()
 
-    # Download the expanded graph
-    expanded_graph_ = ox.graph_from_bbox((expanded_north, expanded_south, expanded_east, expanded_west), network_type='drive')
-
-    return expanded_graph_
+    return graph_
 
 
-def create_grid_gdf(city_grid_data):
-    """Convert city grid data to GeoDataFrame with polygons"""
-    geometries = []
-    for _, row in city_grid_data.iterrows():
-        geometries.append(Polygon([
-            (row['min_lon'], row['min_lat']),
-            (row['max_lon'], row['min_lat']),
-            (row['max_lon'], row['max_lat']),
-            (row['min_lon'], row['max_lat'])
-        ]))
-    return gpd.GeoDataFrame(
-        city_grid_data,
-        geometry=geometries,
-        crs="EPSG:4326"
-    )
 
-
-def process_roads(graph, grid_gdf, grid_features):
-    """Process road network and merge with grid features"""
-    # Convert to GeoDataFrame
-    roads = ox.graph_to_gdfs(graph, nodes=False, edges=True)
-    roads['midpoint'] = roads.geometry.centroid
-
-    # Spatial join with grid cells
-    roads_gdf = gpd.GeoDataFrame(
-        roads[['u', 'v', 'length', 'geometry', 'midpoint']],
-        geometry='midpoint',
-        crs="EPSG:4326"
-    )
-
-    joined = gpd.sjoin(roads_gdf, grid_gdf, how='left', predicate='within')
-    roads = roads.merge(
-        joined[['u', 'v', 'density_rank', 'index_right']],
-        on=['u', 'v'],
-        how='left'
-    )
-
-    # Merge features
-    roads = roads.merge(
-        grid_features.rename(columns={'index': 'grid_id'}),
-        left_on='index_right',
-        right_on='grid_id',
-        how='left'
-    )
-
-    # Feature engineering
-    roads['length_km'] = roads.geometry.length * 111  # Approximate conversion
-    features = ['poi_score', 'density_rank', 'temp', 'rain', 'length_km']
-    scaler = StandardScaler()
-    roads[features] = scaler.fit_transform(roads[features])
-
-    return roads, scaler
 
 
 
@@ -305,8 +248,7 @@ def main():
     temperature, is_raining = get_weather(CITY_NAME, DATE_TIME)
 
     road_ = download_road_network(CITY_NAME)
-    grid_gdf = create_grid_gdf(city_grid_data)
-    print(grid_gdf)
+
     # Process city grids and collect features
     grid_features = []
     for _, grid in city_grid_data.iterrows():
@@ -316,8 +258,6 @@ def main():
             'amenity', tag_rank_mapping=tag_rank_mapping
         )
         grid_features = extract_grid_features(grid, poi_count, temperature, is_raining)
-        # Process roads and create graph data
-        roads, scaler = process_roads(road_, grid_gdf, pd.DataFrame(grid_features))
 
 
 
