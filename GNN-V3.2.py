@@ -16,7 +16,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 import joblib
 import learn_based as lb
-
+from sklearn.neighbors import NearestNeighbors
+from scipy.spatial.distance import cdist
+from torch_geometric.data import Data
 
 with open('api_keys.json') as json_file:
     api_keys = json.load(json_file)
@@ -135,7 +137,7 @@ def aggregate_poi_ranks(pois, tag_rank_mapping, tag_key='amenity'):
     return total_rank
 
 
-def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=100, tag_rank_mapping=None):
+def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=10, tag_rank_mapping=None):
     # the filter is applied on the same key as poi_type.
     query = f"""
     [out:json];
@@ -202,12 +204,18 @@ def extract_grid_features(grid, pois_count, temperature, is_raining):
         rain_val = 1
     else:
         rain_val=0
+
+    if temperature>= 10:
+        temp_val = 1
+    else:
+        temp_val = 0
+
     # Combine all features into a single dictionary.
     grid_features = {
         "grid_data": grid_data,
         "poi_score": pois_count,
         "density_rank": density_rank,
-        "temp": temperature,
+        "temp": temp_val,
         "rain": rain_val
     }
 
@@ -273,27 +281,133 @@ def prepare_data(road_graph, stib_stops_data):
     return data
 
 
-def train_model(data):
-    # Split data into features and labels
-    X = data.drop('is_bus_stop', axis=1)
-    y = data['is_bus_stop']
+class GCN(torch.nn.Module):
+    """Graph Convolutional Network for bus stop prediction"""
 
-    # Split into training and testing sets
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    def __init__(self, input_dim, hidden_dim):
+        super().__init__()
+        self.conv1 = GCNConv(input_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, 1)
 
-    # Initialize the model
-    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        x = self.conv1(x, edge_index)
+        x = torch.relu(x)
+        x = f.dropout(x, training=self.training)
+        x = self.conv2(x, edge_index)
+        return x
 
-    # Train the model
-    model.fit(X_train, y_train)
 
-    # Evaluate the model
-    accuracy = model.score(X_test, y_test)
-    print(f'Model Accuracy: {accuracy:.2f}')
+def prepare_gnn_data(road_graph, grid_features_list, stib_stops_data):
+    """Prepares PyG Data object with node features and labels"""
+    # Extract road nodes and coordinates
+    road_nodes = [n for n in road_graph.nodes if not str(n).startswith('bus_stop_')]
+    road_coords = np.array([[road_graph.nodes[n]['y'], road_graph.nodes[n]['x']] for n in road_nodes])
 
-    # Save the trained model
-    joblib.dump(model, 'bus_stop_predictor.pkl')
+    # Create labels using nearest neighbor search
+    bus_stop_coords = stib_stops_data[['stop_lat', 'stop_lon']].values
+    nbrs = NearestNeighbors(n_neighbors=1).fit(road_coords)
+    _, indices = nbrs.kneighbors(bus_stop_coords)
+    labels = np.zeros(len(road_nodes), dtype=int)
+    labels[indices.flatten()] = 1
 
+    # Create node features
+    features = []
+    for node in road_nodes:
+        data = road_graph.nodes[node]
+        lat, lon = data['y'], data['x']
+        degree = road_graph.degree[node]
+
+        # Find grid features
+        grid_feature = next((gf for gf in grid_features_list
+                             if gf['grid_data']['min_lat'] <= lat <= gf['grid_data']['max_lat'] and
+                             gf['grid_data']['min_lon'] <= lon <= gf['grid_data']['max_lon']), None)
+
+        features.append([
+            lat, lon, degree,
+            grid_feature['density_rank'] if grid_feature else 0,
+            grid_feature['poi_score'] if grid_feature else 0,
+            1 if degree > 2 else 0
+        ])
+
+    # Normalize features
+    features = np.array(features, dtype=np.float32)
+    features[:, 0] = (features[:, 0] - features[:, 0].min()) / (features[:, 0].max() - features[:, 0].min())
+    features[:, 1] = (features[:, 1] - features[:, 1].min()) / (features[:, 1].max() - features[:, 1].min())
+
+    # Create PyG Data object
+    edge_index = from_networkx(road_graph.subgraph(road_nodes)).edge_index
+    return Data(
+        x=torch.tensor(features, dtype=torch.float),
+        edge_index=edge_index,
+        y=torch.tensor(labels, dtype=torch.long)
+    )
+
+
+def train_model(data, epochs=200):
+    """Trains the GNN model"""
+    model = GCN(input_dim=6, hidden_dim=16)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    criterion = torch.nn.BCEWithLogitsLoss()
+
+    # Create train/test masks
+    indices = np.arange(data.num_nodes)
+    train_idx, test_idx = train_test_split(indices, test_size=0.2, random_state=42)
+    data.train_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+    data.test_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+    data.train_mask[train_idx] = True
+    data.test_mask[test_idx] = True
+
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()
+        out = model(data)
+        loss = criterion(out.squeeze()[data.train_mask], data.y.float()[data.train_mask])
+        loss.backward()
+        optimizer.step()
+
+        # Calculate accuracy
+        model.eval()
+        with torch.no_grad():
+            pred = (torch.sigmoid(out.squeeze()) > 0.5).float()
+            train_acc = (pred[data.train_mask] == data.y[data.train_mask]).float().mean()
+            test_acc = (pred[data.test_mask] == data.y[data.test_mask]).float().mean()
+
+        if epoch % 20 == 0:
+            print(f'Epoch {epoch:3d} | Loss: {loss:.4f} | Train Acc: {train_acc:.2f} | Test Acc: {test_acc:.2f}')
+
+    return model
+
+
+def predict_new_stops(model, data, road_graph, stib_stops, min_distance=500):
+    """Generates predictions and filters valid locations"""
+    model.eval()
+    with torch.no_grad():
+        probs = torch.sigmoid(model(data)).squeeze().numpy()
+
+    # Create candidate DataFrame
+    road_nodes = [n for n in road_graph.nodes if not str(n).startswith('bus_stop_')]
+    df = pd.DataFrame({
+        'node': road_nodes,
+        'lat': [road_graph.nodes[n]['y'] for n in road_nodes],
+        'lon': [road_graph.nodes[n]['x'] for n in road_nodes],
+        'degree': [road_graph.degree[n] for n in road_nodes],
+        'probability': probs
+    })
+
+    # Filter candidates
+    valid_candidates = df[
+        (df['degree'] <= 2) &  # Exclude junctions
+        (df['probability'] > 0.7)  # High probability
+        ].sort_values('probability', ascending=False)
+
+    # Calculate distances to existing stops
+    existing_coords = stib_stops[['stop_lat', 'stop_lon']].values
+    candidate_coords = valid_candidates[['lat', 'lon']].values
+    distances = cdist(candidate_coords, existing_coords) * 111000  # Convert degrees to meters
+    valid_candidates['min_distance'] = np.min(distances, axis=1)
+
+    return valid_candidates[valid_candidates['min_distance'] > min_distance]
 
 def main():
     global features
@@ -308,16 +422,28 @@ def main():
 
     data = prepare_data(road_graph, stib_stops_data)
 
-    # Call function to train with existing stops
-    train_model(data)
-
+    # Process city grids and collect features
+    grid_features_list = []
     for _, grid in city_grid_data.iterrows():
         pois, poi_count = get_pois(
-            grid["min_lat"], grid["min_lon"], grid["max_lat"], grid["max_lon"], 'amenity',
-            tag_rank_mapping=tag_rank_mapping)
-        features = extract_grid_features(grid, poi_count, temperature, is_raining)
+            grid["min_lat"], grid["min_lon"], grid["max_lat"], grid["max_lon"],
+            'amenity', tag_rank_mapping=tag_rank_mapping
+        )
+        grid_features = extract_grid_features(grid, poi_count, temperature, is_raining)
+        grid_features_list.append(grid_features)
 
+    # Prepare GNN data
+    data = prepare_gnn_data(road_graph, grid_features_list, stib_stops_data)
 
+    # Train model
+    model = train_model(data)
+
+    # Generate predictions
+    new_stops = predict_new_stops(model, data, road_graph, stib_stops_data)
+
+    # Display results
+    print("\nRecommended new bus stop locations:")
+    print(new_stops[['lat', 'lon', 'probability', 'min_distance']].head(10))
 
     print("Extracted Grid Features:")
     print(features)

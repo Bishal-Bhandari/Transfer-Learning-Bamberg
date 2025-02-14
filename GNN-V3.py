@@ -43,7 +43,7 @@ CONFIG = {
     },
     "proximity_threshold": 0.00045,  # ~50 meters
     "max_candidates_per_grid": 5,
-    "output_dir": "output",
+    "output_dir": "Output",
     # Add default POI weights
     "default_poi_weights": {
         "amenity": {
@@ -62,7 +62,7 @@ CONFIG = {
     }
 }
 
-# Create output directory
+# Create Output directory
 Path(CONFIG["output_dir"]).mkdir(parents=True, exist_ok=True)
 
 
@@ -323,7 +323,7 @@ class SpatialProcessor:
 
 
 class OutputGenerator:
-    """Handles output generation"""
+    """Handles Output generation"""
 
     @staticmethod
     def save_to_ods(data: pd.DataFrame, filename: str):
