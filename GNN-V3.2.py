@@ -180,7 +180,6 @@ def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=10,
         #     print(f"{idx}. {poi['name']}")
         #     print(f"   Coordinates: ({poi['latitude']}, {poi['longitude']})")
         #     print(f"   {poi_type.capitalize()}: {poi['tags'].get(poi_type, 'N/A')}\n")
-        print(popularity_total)
         return pois, popularity_total
 
     except requests.exceptions.RequestException as e:
@@ -305,27 +304,33 @@ def validate_road_data(road_data):
     return nodes, edges
 
 
-def normalize_data(grid_features):
-    """Normalize numerical features in grid_features, road_nodes, and road_edges."""
-
-    # Initialize MinMaxScaler
-    scaler = MinMaxScaler()
-
-    # Create DataFrame for grid features
-    grid_df = pd.DataFrame([grid_features])
-
-    # Columns to normalize
-    grid_cols = ['density_rank', 'poi_score', 'temp', 'rain']
-
-    # Check for variability before scaling
-    for col in grid_cols:
-        if grid_df[col].std() > 0:  # Check if standard deviation is not zero
-            grid_df[col] = scaler.fit_transform(grid_df[[col]])
-
-    # Return the normalized features
-    normalized_grid = grid_df.to_dict(orient='records')[0]
-
-    return normalized_grid
+# def normalize_data(grid_features):
+#     # Features to normalize
+#
+#     # Features to normalize
+#     grid_cols = ['density_rank', 'poi_score', 'temp', 'rain']
+#
+#     # Convert grid_features to DataFrame
+#     grid_df = pd.DataFrame([grid_features])
+#
+#     # Apply Min-Max normalization
+#     for col in grid_cols:
+#         col_min = grid_df[col].min()
+#         col_max = grid_df[col].max()
+#
+#         # Print min and max for debugging
+#         print(f"{col} min: {col_min}, max: {col_max}")
+#
+#         # If min and max are the same (no variation), set to a default value or skip normalization
+#         if col_max == col_min:
+#             grid_df[col] = 0  # Or you can set it to a specific value like grid_df[col] = 0.5
+#         else:
+#             grid_df[col] = (grid_df[col] - col_min) / (col_max - col_min)
+#
+#     # Convert the normalized DataFrame back to dictionary
+#     normalized_grid = grid_df.to_dict(orient='records')[0]
+#
+#     return normalized_grid
 
 
 def main():
@@ -351,8 +356,7 @@ def main():
 
         grid_features = extract_grid_features(grid, poi_count, temperature, is_raining)
         print(grid_features)
-        normalized_grid= normalize_data(grid_features)
-        print(normalized_grid)
+
 
     if temperature is not None:
         print(f"\nWeather in {CITY_NAME} on {DATE_TIME}:")
