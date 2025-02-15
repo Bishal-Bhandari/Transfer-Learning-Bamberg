@@ -18,9 +18,6 @@ import torch.nn.functional as F
 from sklearn.preprocessing import StandardScaler
 from shapely.geometry import Polygon
 import geopandas as gpd
-from torch_geometric.utils import from_networkx
-import momepy
-import geopandas as gpd
 
 # Load API keys
 with open('api_keys.json') as json_file:
@@ -227,13 +224,20 @@ def download_road_network(place_name):
 
     graph_ = ox.graph_from_place(place_name, network_type='drive')
 
-    # Ensure the road network is connected
-    if not nx.is_connected(graph_.to_undirected()):
-        largest_component = max(nx.connected_components(graph_.to_undirected()), key=len)
-        graph_ = graph_.subgraph(largest_component).copy()
+    # Get the bounding box of the city
+    nodes = ox.graph_to_gdfs(graph_, nodes=True, edges=False)
+    north, south, east, west = nodes.union_all().bounds
+    radius = 0.01
+    # Expand the bounding box
+    expanded_north = north + radius
+    expanded_south = south - radius
+    expanded_east = east + radius
+    expanded_west = west - radius
 
-    return graph_
+    # Download the expanded graph
+    expanded_graph_ = ox.graph_from_bbox((expanded_north, expanded_south, expanded_east, expanded_west), network_type='drive')
 
+    return expanded_graph_
 
 
 
@@ -282,5 +286,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
