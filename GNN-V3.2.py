@@ -236,15 +236,17 @@ def download_road_network(place_name):
 
     # Download the expanded graph
     expanded_graph_ = ox.graph_from_bbox((expanded_north, expanded_south, expanded_east, expanded_west), network_type='drive', simplify=False)
-    print(expanded_graph_.edges)
+
     # Explicitly add 'osmid' attribute to nodes (matches graph node IDs)
     for node_id in expanded_graph_.nodes():
         expanded_graph_.nodes[node_id]['osmid'] = node_id
 
     # Explicitly add 'u' and 'v' attributes to edges
-    for u, v, key in expanded_graph_.edges(keys=True):
-        expanded_graph_.edges[u, v, key]['u'] = u
-        expanded_graph_.edges[u, v, key]['v'] = v
+    # Add 'u' and 'v' to edges using bulk operations
+    u_values = {(u, v, k): u for u, v, k in expanded_graph_.edges(keys=True)}
+    v_values = {(u, v, k): v for u, v, k in expanded_graph_.edges(keys=True)}
+    nx.set_edge_attributes(expanded_graph_, u_values, 'u')
+    nx.set_edge_attributes(expanded_graph_, v_values, 'v')
 
     return expanded_graph_
 
@@ -255,6 +257,7 @@ def validate_road_data(road_data):
     if isinstance(road_data, nx.Graph):
         try:
             nodes, edges = ox.graph_to_gdfs(road_data)
+            print(edges)
         except Exception as e:
             raise ValueError(f"Error converting graph to GeoDataFrames: {e}")
     elif isinstance(road_data, dict):
