@@ -9,7 +9,7 @@ from torch_geometric.data import Data
 from torch_geometric.nn import SAGEConv, BatchNorm
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from shapely.geometry import Point, LineString
 import networkx as nx
 from torch_geometric.nn import SAGEConv, BatchNorm
@@ -180,7 +180,7 @@ def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=10,
         #     print(f"{idx}. {poi['name']}")
         #     print(f"   Coordinates: ({poi['latitude']}, {poi['longitude']})")
         #     print(f"   {poi_type.capitalize()}: {poi['tags'].get(poi_type, 'N/A')}\n")
-
+        print(popularity_total)
         return pois, popularity_total
 
     except requests.exceptions.RequestException as e:
@@ -227,7 +227,7 @@ def download_road_network(place_name):
     # Get the bounding box of the city
     nodes = ox.graph_to_gdfs(graph_, nodes=True, edges=False)
     north, south, east, west = nodes.union_all().bounds
-    radius = 0.01
+    radius = 0.1
     # Expand the bounding box
     expanded_north = north + radius
     expanded_south = south - radius
@@ -257,7 +257,6 @@ def validate_road_data(road_data):
     if isinstance(road_data, nx.Graph):
         try:
             nodes, edges = ox.graph_to_gdfs(road_data)
-            print(edges)
         except Exception as e:
             raise ValueError(f"Error converting graph to GeoDataFrames: {e}")
     elif isinstance(road_data, dict):
@@ -306,6 +305,28 @@ def validate_road_data(road_data):
     return nodes, edges
 
 
+def normalize_data(grid_features):
+    """Normalize numerical features in grid_features, road_nodes, and road_edges."""
+
+    # Initialize MinMaxScaler
+    scaler = MinMaxScaler()
+
+    # Create DataFrame for grid features
+    grid_df = pd.DataFrame([grid_features])
+
+    # Columns to normalize
+    grid_cols = ['density_rank', 'poi_score', 'temp', 'rain']
+
+    # Check for variability before scaling
+    for col in grid_cols:
+        if grid_df[col].std() > 0:  # Check if standard deviation is not zero
+            grid_df[col] = scaler.fit_transform(grid_df[[col]])
+
+    # Return the normalized features
+    normalized_grid = grid_df.to_dict(orient='records')[0]
+
+    return normalized_grid
+
 
 def main():
     global features
@@ -327,9 +348,11 @@ def main():
             grid["max_lat"], grid["max_lon"],
             'amenity', tag_rank_mapping=tag_rank_mapping
         )
+
         grid_features = extract_grid_features(grid, poi_count, temperature, is_raining)
-
-
+        print(grid_features)
+        normalized_grid= normalize_data(grid_features)
+        print(normalized_grid)
 
     if temperature is not None:
         print(f"\nWeather in {CITY_NAME} on {DATE_TIME}:")
@@ -352,4 +375,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
