@@ -30,7 +30,7 @@ np.random.seed(42)
 
 # Constants
 CITY_NAME = "Brussels"
-DATE_TIME = "2025-02-07 14:00"
+DATE_TIME = "2025-02-15 11:00"
 GRID_FILE = "Training Data/city_grid_density.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
@@ -222,7 +222,7 @@ def extract_grid_features(grid, pois_count, temperature, is_raining):
 def download_road_network(place_name):
     print(f"Downloading road network data for {place_name}...")
 
-    graph_ = ox.graph_from_place(place_name, network_type='drive')
+    graph_ = ox.graph_from_place(place_name, network_type='drive', simplify=False)
 
     # Get the bounding box of the city
     nodes = ox.graph_to_gdfs(graph_, nodes=True, edges=False)
@@ -235,11 +235,72 @@ def download_road_network(place_name):
     expanded_west = west - radius
 
     # Download the expanded graph
-    expanded_graph_ = ox.graph_from_bbox((expanded_north, expanded_south, expanded_east, expanded_west), network_type='drive')
+    expanded_graph_ = ox.graph_from_bbox((expanded_north, expanded_south, expanded_east, expanded_west), network_type='drive', simplify=False)
+    print(expanded_graph_.edges)
+    # Explicitly add 'osmid' attribute to nodes (matches graph node IDs)
+    for node_id in expanded_graph_.nodes():
+        expanded_graph_.nodes[node_id]['osmid'] = node_id
+
+    # Explicitly add 'u' and 'v' attributes to edges
+    for u, v, key in expanded_graph_.edges(keys=True):
+        expanded_graph_.edges[u, v, key]['u'] = u
+        expanded_graph_.edges[u, v, key]['v'] = v
 
     return expanded_graph_
 
 
+def validate_road_data(road_data):
+    missing_info = []
+    # If input is a NetworkX graph:
+    if isinstance(road_data, nx.Graph):
+        try:
+            nodes, edges = ox.graph_to_gdfs(road_data)
+        except Exception as e:
+            raise ValueError(f"Error converting graph to GeoDataFrames: {e}")
+    elif isinstance(road_data, dict):
+        if not all(k in road_data for k in ['nodes', 'edges']):
+            raise ValueError("Input dict must contain keys 'nodes' and 'edges'.")
+        nodes = road_data['nodes']
+        edges = road_data['edges']
+    else:
+        raise ValueError("road_data must be a NetworkX graph or a dict with 'nodes' and 'edges'.")
+
+    # Check for node identifier
+    if 'osmid' not in nodes.columns and 'id' not in nodes.columns:
+        # Fallback: use the index as identifier and add a column
+        nodes = nodes.copy()
+        nodes['osmid'] = nodes.index
+        print("Node identifier not found; using index as 'osmid'.")
+
+    # Ensure required node columns exist
+    required_node_cols = ['geometry', 'x', 'y']
+    for col in required_node_cols:
+        if col not in nodes.columns:
+            missing_info.append(f"Missing '{col}' in nodes.")
+
+    # For edges, check for 'u' and 'v'
+    if 'u' not in edges.columns or 'v' not in edges.columns:
+        # Fallback: if edges index is a MultiIndex or tuple, try to extract u and v
+        def extract_uv(row):
+            # If the index of the row is a tuple of length >=2, use its first two elements.
+            if isinstance(row.name, tuple) and len(row.name) >= 2:
+                return pd.Series({'u': row.name[0], 'v': row.name[1]})
+            else:
+                return pd.Series({'u': None, 'v': None})
+
+        uv = edges.apply(extract_uv, axis=1)
+        if uv['u'].isna().all() or uv['v'].isna().all():
+            missing_info.append("Missing 'u' and 'v' in edges and could not be inferred.")
+        else:
+            edges = edges.join(uv)
+            print("Edge identifiers 'u' and 'v' were missing; inferred from index.")
+
+    # If any missing info remains, raise error with details.
+    if missing_info:
+        raise ValueError("Road data is missing required fields:\n" + "\n".join(missing_info))
+
+    print("Road data validation passed.")
+    return nodes, edges
 
 
 
@@ -252,6 +313,8 @@ def main():
     temperature, is_raining = get_weather(CITY_NAME, DATE_TIME)
 
     road_ = download_road_network(CITY_NAME)
+
+    road_nodes, road_edges = validate_road_data(road_)
 
     # Process city grids and collect features
     grid_features = []
