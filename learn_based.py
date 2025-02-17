@@ -14,8 +14,7 @@ import joblib
 def prepare_data(stop_data):
     """Process raw bus stop data into graph format and generate labels using clustering."""
     # Use only coordinates as features
-    bus_stops['route_short_name'] = pd.to_numeric(bus_stops['route_short_name'].astype(str).str.lstrip('N'))
-    features = stop_data[['stop_lat', 'stop_lon', 'route_short_name', 'stop_sequence', 'stop_id', 'direction']].values
+    features = stop_data[['stop_lat', 'stop_lon']].values
 
     # Normalize coordinates
     scaler = StandardScaler()
@@ -70,11 +69,11 @@ def train_model(features, edge_index, labels, num_epochs=1000):
     graph_data.train_mask = mask
     graph_data.val_mask = ~mask
 
-    # Initialize model with out_channels=1
+    # Initialize model
     model = BusStopGNN(
         input_dim=features.shape[1],
-        hidden_dim=64,
-        output_dim=1
+        hidden_dim=32,
+        output_dim=2  # Two clusters/classes
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
@@ -83,19 +82,15 @@ def train_model(features, edge_index, labels, num_epochs=1000):
         model.train()
         optimizer.zero_grad()
         out = model(graph_data)
-        # Use BCEWithLogitsLoss for binary classification
-        loss = F.binary_cross_entropy_with_logits(
-            out[graph_data.train_mask].view(-1),
-            graph_data.y[graph_data.train_mask].float()
-        )
+        loss = F.cross_entropy(out[graph_data.train_mask], graph_data.y[graph_data.train_mask])
         loss.backward()
         optimizer.step()
 
         # Validation
         model.eval()
         with torch.no_grad():
-            preds = (torch.sigmoid(out[graph_data.val_mask]) >= 0.5).long().view(-1)
-            correct = (preds == graph_data.y[graph_data.val_mask]).sum().item()
+            pred = out.argmax(dim=1)
+            correct = (pred[graph_data.val_mask] == graph_data.y[graph_data.val_mask]).sum().item()
             acc = correct / graph_data.val_mask.sum().item()
 
         if acc > best_acc:
@@ -107,11 +102,10 @@ def train_model(features, edge_index, labels, num_epochs=1000):
 
     return model, graph_data
 
-
 # 4. Prediction Function
 def predict_new_stop(new_coords, graph_data, model_path='Output/best_bus_stop_model.pth'):
     # Load the trained model and scaler
-    model = BusStopGNN(input_dim=6, hidden_dim=64, output_dim=1)
+    model = BusStopGNN(input_dim=2, hidden_dim=32, output_dim=2)
     model.load_state_dict(torch.load(model_path))
     scaler = joblib.load('Output/bus_stop_scaler.pkl')
 
@@ -134,15 +128,15 @@ def predict_new_stop(new_coords, graph_data, model_path='Output/best_bus_stop_mo
     pred_edge_index = torch.cat([graph_data.edge_index, new_edges_tensor], dim=1)
     pred_data = Data(x=full_features, edge_index=pred_edge_index)
 
-    # Make prediction using sigmoid for binary classification
+    # Make prediction
     model.eval()
     with torch.no_grad():
-        logit = model(pred_data)
-        prob = torch.sigmoid(logit[-1])
-        predicted_label = int(prob >= 0.5)
+        logits = model(pred_data)
+        # The new node is the last one
+        prob = F.softmax(logits[-1], dim=0)
+        predicted_label = int(prob.argmax())
 
     return predicted_label, prob.numpy()
-
 
 # 5. Main Execution Flow
 if __name__ == "__main__":
@@ -158,7 +152,7 @@ if __name__ == "__main__":
     # Train model and capture graph_data
     trained_model, graph_data = train_model(features, edge_index, labels)
 
-    # (Brussels)
+    # Example prediction with a new bus stop coordinate (Brussels)
     new_stop = [50.8503, 4.3517]
     predicted_label, prediction_prob = predict_new_stop(new_stop, graph_data)
     print(f"Prediction probabilities: {prediction_prob}")
