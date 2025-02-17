@@ -1,10 +1,14 @@
 import datetime
+import geopandas as gpd
 import joblib
 import pandas as pd
 import json
 import requests
 import torch
 import numpy as np
+from shapely.geometry.geo import box
+from sklearn.metrics.pairwise import haversine_distances
+from tenacity import retry, stop_after_attempt, wait_exponential
 import osmnx as ox
 from folium import folium
 from pandas._libs.internals import defaultdict
@@ -13,6 +17,11 @@ import networkx as nx
 from torch_geometric.nn import SAGEConv, BatchNorm
 import torch.nn.functional as F
 from tqdm import tqdm
+from typing import Tuple, List, Dict
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 
 
 # Load API keys
@@ -20,17 +29,21 @@ with open('api_keys.json') as json_file:
     api_keys = json.load(json_file)
 API_KEY = api_keys['Weather_API']['API_key']
 
-# Reproducibility
-torch.manual_seed(42)
-np.random.seed(42)
 
 # Constants
 CITY_NAME = "Brussels"
-DATE_TIME = "2025-02-17 13:40"
+DATE_TIME = "2025-02-17 17:00"
 GRID_FILE = "Training Data/city_grid_density.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
 MODEL_SAVE_PATH = "Output/best_bus_stop_model.pth"
+
+
+class Config:
+    CITY_NAME = "Brussels"
+    MIN_STOP_DISTANCE = 500  # meters
+    PREDICTION_THRESHOLD = 0.7
+    ROAD_TYPES = ['motorway', 'trunk', 'primary', 'secondary']
 
 
 ox.settings.log_console = True
@@ -42,10 +55,8 @@ tqdm.pandas()
 class BusStopPredictor(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels):
         super().__init__()
-        # Use SAGEConv in a way that uses a single linear layer:
-        self.conv1 = SAGEConv(in_channels, hidden_channels, normalize=False, bias=True)
-        self.conv2 = SAGEConv(hidden_channels, hidden_channels, normalize=False, bias=True)
-        # Rename final layer to 'predictor' to match saved state_dict:
+        self.conv1 = SAGEConv(in_channels, hidden_channels)
+        self.conv2 = SAGEConv(hidden_channels, hidden_channels)
         self.predictor = torch.nn.Linear(hidden_channels, out_channels)
 
     def forward(self, x, edge_index):
@@ -58,10 +69,11 @@ class BusStopPredictor(torch.nn.Module):
 
 
 def read_city_grid(file_path):
-    """ Reads and cleans city grid density data """
+    required_columns = ["min_lat", "max_lat", "min_lon", "max_lon", "density_rank"]
     df = pd.read_excel(file_path, engine="odf")
-    df = df[["min_lat",	"max_lat",	"min_lon", "max_lon", "density_rank"]].dropna()
-    return df
+    if not all(col in df.columns for col in required_columns):
+        raise ValueError(f"Missing required columns in grid file. Needed: {required_columns}")
+    return df[required_columns].dropna()
 
 
 def read_stib_stops(file_path):
@@ -157,7 +169,8 @@ def aggregate_poi_ranks(pois, tag_rank_mapping, tag_key='amenity'):
     return total_rank
 
 
-def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=50, tag_rank_mapping=None):
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=100, tag_rank_mapping=None):
     # the filter is applied on the same key as poi_type.
     query = f"""
     [out:json];
@@ -237,7 +250,7 @@ def extract_grid_features(grid, pois_count, temperature, is_raining):
 
 
 def download_road_network(place_name):
-    print(f"Downloading road network data for {place_name}...")
+    logger.info(f"Downloading road network for {place_name}...")
 
     graph_ = ox.graph_from_place(place_name, network_type='drive', simplify=False)
 
@@ -363,6 +376,20 @@ def process_edges_and_predict(road_graph, city_grid_data, model, scaler, tempera
     midpoints = []
     features = []
 
+    # Create geometry for grid cells
+    city_grid_data['geometry'] = city_grid_data.apply(
+        lambda row: box(row['min_lon'], row['min_lat'], row['max_lon'], row['max_lat']),
+        axis=1
+    )
+    grid_gdf = gpd.GeoDataFrame(city_grid_data, geometry='geometry')
+
+    # Vectorized spatial join
+    edges_gdf = ox.graph_to_gdfs(road_graph, nodes=False, edges=True)
+    edges_gdf['midpoint'] = edges_gdf['geometry'].apply(lambda x: x.interpolate(0.5, normalized=True))
+    midpoints_gdf = gpd.GeoDataFrame(geometry=edges_gdf['midpoint'], crs="EPSG:4326")
+
+    joined = gpd.sjoin(midpoints_gdf, grid_gdf, how='left', predicate='within')
+
     for idx, (_, edge) in enumerate(edges_gdf.iterrows()):
         line = edge['geometry']
         midpoint = line.interpolate(0.5, normalized=True)
@@ -418,6 +445,24 @@ def process_edges_and_predict(road_graph, city_grid_data, model, scaler, tempera
 
 def filter_and_save_predictions(midpoints, features, probabilities, output_file="predicted_stops.ods"):
     selected = []
+    # Filter initial candidates
+    candidates = [
+        (i, prob, lat, lon)
+        for i, (prob, (lat, lon)) in enumerate(zip(probabilities, midpoints))
+        if prob > 0.5 and features[i][5] == 0
+    ]
+
+    # Distance-based filtering (500m minimum)
+    selected = []
+    coordinates = []
+    for i, prob, lat, lon in sorted(candidates, key=lambda x: -x[1]):
+        coord_rad = np.radians([[lat, lon]])
+        if any(haversine_distances(coord_rad, np.radians([c]))[0][0] * 6371000 < 500
+               for c in coordinates):
+            continue
+        selected.append(i)
+        coordinates.append([lat, lon])
+
     for i, prob in enumerate(probabilities):
         is_junction = features[i][5]
         if prob > 0.5 and is_junction == 0:
@@ -433,6 +478,22 @@ def filter_and_save_predictions(midpoints, features, probabilities, output_file=
         folium.Marker([lat, lon], icon=folium.Icon(color='green')).add_to(m)
     m.save("bus_stops_map.html")
     return df
+
+
+def validate_predictions(predicted_gdf: gpd.GeoDataFrame, existing_stops_gdf: gpd.GeoDataFrame):
+    """Compare predictions with existing stops"""
+    buffer_distance = 50  # meters
+    existing_buffers = existing_stops_gdf.buffer(buffer_distance / 111000)
+
+    # Calculate coverage metrics
+    matched = predicted_gdf.geometry.apply(
+        lambda x: any(x.distance(existing) < buffer_distance for existing in existing_buffers)
+    )
+
+    logger.info(f"Prediction validation:")
+    logger.info(f"Total predictions: {len(predicted_gdf)}")
+    logger.info(f"Matching existing stops: {matched.sum()} ({matched.mean():.1%})")
+    return matched
 
 
 def main():
