@@ -1,5 +1,4 @@
 import datetime
-
 import joblib
 import pandas as pd
 import json
@@ -13,6 +12,8 @@ from torch_geometric.data import Data
 import networkx as nx
 from torch_geometric.nn import SAGEConv, BatchNorm
 import torch.nn.functional as F
+from tqdm import tqdm
+
 
 # Load API keys
 with open('api_keys.json') as json_file:
@@ -25,33 +26,35 @@ np.random.seed(42)
 
 # Constants
 CITY_NAME = "Brussels"
-DATE_TIME = "2025-02-17 11:00"
+DATE_TIME = "2025-02-17 13:40"
 GRID_FILE = "Training Data/city_grid_density.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
-MODEL_SAVE_PATH = "Output/"
-JUNCTION_BUFFER = 50  # meters
-CELL_SIZE = 500  # meters
+MODEL_SAVE_PATH = "Output/best_bus_stop_model.pth"
+
+
+ox.settings.log_console = True
+ox.settings.use_cache = True
+ox.settings.cache_folder = "osmnx_cache"  # Optional custom cache location
+tqdm.pandas()
 
 
 class BusStopPredictor(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels):
         super().__init__()
-        self.conv1 = SAGEConv(in_channels, hidden_channels)
-        self.bn1 = BatchNorm(hidden_channels)
-        self.conv2 = SAGEConv(hidden_channels, hidden_channels)
-        self.bn2 = BatchNorm(hidden_channels)
-        self.lin = torch.nn.Linear(hidden_channels, out_channels)
+        # Use SAGEConv in a way that uses a single linear layer:
+        self.conv1 = SAGEConv(in_channels, hidden_channels, normalize=False, bias=True)
+        self.conv2 = SAGEConv(hidden_channels, hidden_channels, normalize=False, bias=True)
+        # Rename final layer to 'predictor' to match saved state_dict:
+        self.predictor = torch.nn.Linear(hidden_channels, out_channels)
 
     def forward(self, x, edge_index):
         x = self.conv1(x, edge_index)
-        x = self.bn1(x)
         x = F.relu(x)
         x = F.dropout(x, p=0.5, training=self.training)
         x = self.conv2(x, edge_index)
-        x = self.bn2(x)
         x = F.relu(x)
-        return self.lin(x)
+        return self.predictor(x)
 
 
 def read_city_grid(file_path):
@@ -154,7 +157,7 @@ def aggregate_poi_ranks(pois, tag_rank_mapping, tag_key='amenity'):
     return total_rank
 
 
-def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=10, tag_rank_mapping=None):
+def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=50, tag_rank_mapping=None):
     # the filter is applied on the same key as poi_type.
     query = f"""
     [out:json];
@@ -320,8 +323,35 @@ def validate_road_data(road_data):
 
 
 def load_model_and_scaler(model_path, scaler_path):
+    # Load the saved state dictionary
+    state_dict = torch.load(model_path)
+
+    # Rename the final layer keys:
+    if "predictor.weight" in state_dict:
+        state_dict["lin.weight"] = state_dict.pop("predictor.weight")
+        state_dict["lin.bias"] = state_dict.pop("predictor.bias")
+
+    # For the first SAGEConv layer:
+    # The saved state dict has "conv1.lin.weight" and "conv1.bias"
+    # but your current SAGEConv expects "conv1.lin_l.weight" and "conv1.lin_l.bias" (and "conv1.lin_r.weight").
+    if "conv1.lin.weight" in state_dict:
+        state_dict["conv1.lin_l.weight"] = state_dict.pop("conv1.lin.weight")
+        state_dict["conv1.lin_l.bias"] = state_dict.pop("conv1.bias")
+        # Duplicate for right-side weights (this is a heuristic; adjust if necessary)
+        state_dict["conv1.lin_r.weight"] = state_dict["conv1.lin_l.weight"]
+
+    # Do the same for the second SAGEConv layer:
+    if "conv2.lin.weight" in state_dict:
+        state_dict["conv2.lin_l.weight"] = state_dict.pop("conv2.lin.weight")
+        state_dict["conv2.lin_l.bias"] = state_dict.pop("conv2.bias")
+        state_dict["conv2.lin_r.weight"] = state_dict["conv2.lin_l.weight"]
+
+    # Note: Since your current model uses BatchNorm (bn1, bn2) but the saved state dict has no such keys,
+    # you can either remove these layers from the current model or leave them uninitialized.
+    # (Alternatively, you might load with strict=False if these are not critical.)
+
     model = BusStopPredictor(in_channels=6, hidden_channels=64, out_channels=1)
-    model.load_state_dict(torch.load(model_path))
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
     scaler = joblib.load(scaler_path)
     return model, scaler
@@ -429,7 +459,7 @@ def main():
     road_nodes, road_edges = validate_road_data(road_graph)
 
     # Load model and scaler
-    model, scaler = load_model_and_scaler(MODEL_SAVE_PATH, "bus_stop_scaler.pkl")
+    model, scaler = load_model_and_scaler(MODEL_SAVE_PATH, "Output/bus_stop_scaler.pkl")
 
     # Process edges and predict
     midpoints, features, probabilities = process_edges_and_predict(
