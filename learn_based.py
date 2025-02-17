@@ -71,9 +71,9 @@ def train_model(features, edge_index, labels, num_epochs=1000):
 
     # Initialize model
     model = BusStopGNN(
-        input_dim=features.shape[1],
-        hidden_dim=32,
-        output_dim=2  # Two clusters/classes
+        input_dim=features.shape[6],
+        hidden_dim=64,
+        output_dim=1
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 
@@ -105,7 +105,7 @@ def train_model(features, edge_index, labels, num_epochs=1000):
 # 4. Prediction Function
 def predict_new_stop(new_coords, graph_data, model_path='Output/best_bus_stop_model.pth'):
     # Load the trained model and scaler
-    model = BusStopGNN(input_dim=2, hidden_dim=32, output_dim=2)
+    model = BusStopGNN(input_dim=6, hidden_dim=64, output_dim=1)
     model.load_state_dict(torch.load(model_path))
     scaler = joblib.load('Output/bus_stop_scaler.pkl')
 
@@ -152,7 +152,7 @@ if __name__ == "__main__":
     # Train model and capture graph_data
     trained_model, graph_data = train_model(features, edge_index, labels)
 
-    # Example prediction with a new bus stop coordinate (Brussels)
+    # (Brussels)
     new_stop = [50.8503, 4.3517]
     predicted_label, prediction_prob = predict_new_stop(new_stop, graph_data)
     print(f"Prediction probabilities: {prediction_prob}")
