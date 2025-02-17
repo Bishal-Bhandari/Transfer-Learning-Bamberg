@@ -10,18 +10,9 @@ import osmnx as ox
 from folium import folium
 from pandas._libs.internals import defaultdict
 from torch_geometric.data import Data
-from torch_geometric.nn import SAGEConv, BatchNorm
-import torch.nn as nn
-import torch.nn.functional as F
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from shapely.geometry import Point, LineString
 import networkx as nx
 from torch_geometric.nn import SAGEConv, BatchNorm
-import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.preprocessing import StandardScaler
-from shapely.geometry import Polygon
-import geopandas as gpd
 
 # Load API keys
 with open('api_keys.json') as json_file:
@@ -34,11 +25,11 @@ np.random.seed(42)
 
 # Constants
 CITY_NAME = "Brussels"
-DATE_TIME = "2025-02-17 12 :00"
+DATE_TIME = "2025-02-17 11:00"
 GRID_FILE = "Training Data/city_grid_density.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
-MODEL_SAVE_PATH = "bus_stop_predictor.pth"
+MODEL_SAVE_PATH = "Output/"
 JUNCTION_BUFFER = 50  # meters
 CELL_SIZE = 500  # meters
 
@@ -438,7 +429,7 @@ def main():
     road_nodes, road_edges = validate_road_data(road_graph)
 
     # Load model and scaler
-    model, scaler = load_model_and_scaler(MODEL_SAVE_PATH, "Output/bus_stop_scaler.pkl")
+    model, scaler = load_model_and_scaler(MODEL_SAVE_PATH, "bus_stop_scaler.pkl")
 
     # Process edges and predict
     midpoints, features, probabilities = process_edges_and_predict(
