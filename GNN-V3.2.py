@@ -1,79 +1,74 @@
 import datetime
-import geopandas as gpd
-import joblib
 import pandas as pd
 import json
 import requests
 import torch
 import numpy as np
-from shapely.geometry.geo import box
-from sklearn.metrics.pairwise import haversine_distances
-from tenacity import retry, stop_after_attempt, wait_exponential
 import osmnx as ox
-import folium
-from collections import defaultdict
 from torch_geometric.data import Data
+from torch_geometric.nn import SAGEConv, BatchNorm
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from shapely.geometry import Point, LineString
 import networkx as nx
 from torch_geometric.nn import SAGEConv, BatchNorm
+import torch.nn as nn
 import torch.nn.functional as F
-from tqdm import tqdm
-from typing import Tuple, List, Dict
-import logging
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from sklearn.preprocessing import StandardScaler
+from shapely.geometry import Polygon
+import geopandas as gpd
+import folium
+from torch_geometric.loader import DataLoader
+from sklearn.model_selection import train_test_split
+from torch_geometric.utils.convert import from_networkx
 
 # Load API keys
 with open('api_keys.json') as json_file:
     api_keys = json.load(json_file)
 API_KEY = api_keys['Weather_API']['API_key']
 
+# Reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+
 # Constants
 CITY_NAME = "Brussels"
-DATE_TIME = "2023-11-05 11:00"  # Updated to a valid date within 5 days
+DATE_TIME = "2025-02-19 11:00"
 GRID_FILE = "Training Data/city_grid_density.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
 MODEL_SAVE_PATH = "Output/best_bus_stop_model.pth"
-SCALER_SAVE_PATH = "Output/bus_stop_scaler.pkl"
-DEFAULT_TEMP = 15.0  # Default temperature if API fails
-DEFAULT_RAIN = False
-
-class Config:
-    CITY_NAME = "Brussels"
-    MIN_STOP_DISTANCE = 500  # meters
-    PREDICTION_THRESHOLD = 0.5
-    ROAD_TYPES = ['motorway', 'trunk', 'primary', 'secondary']
+JUNCTION_BUFFER = 50  # meters
+CELL_SIZE = 500  # meters
 
 
-ox.settings.log_console = True
-ox.settings.use_cache = True
-ox.settings.cache_folder = "osmnx_cache"  # Optional custom cache location
-tqdm.pandas()
-
-
-class BusStopPredictor(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels):
+class BusStopPredictor(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.conv1 = SAGEConv(in_channels, hidden_channels)
-        self.conv2 = SAGEConv(hidden_channels, hidden_channels)
-        self.predictor = torch.nn.Linear(hidden_channels, out_channels)
+        self.conv1 = SAGEConv(6, 64)  # Matches checkpoint input dimensions
+        self.bn1 = BatchNorm(64)
+        self.conv2 = SAGEConv(64, 64)  # Matches hidden layer dimensions
+        self.bn2 = BatchNorm(64)
+        self.predictor = nn.Linear(64, 1)  # Final layer name matches checkpoint
 
     def forward(self, x, edge_index):
         x = self.conv1(x, edge_index)
+        x = self.bn1(x)
         x = F.relu(x)
-        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.dropout(x, p=0.2, training=self.training)
         x = self.conv2(x, edge_index)
+        x = self.bn2(x)
         x = F.relu(x)
-        return self.predictor(x)
+        x = self.predictor(x)
+        return torch.sigmoid(x)
 
 
 def read_city_grid(file_path):
-    required_columns = ["min_lat", "max_lat", "min_lon", "max_lon", "density_rank"]
+    """ Reads and cleans city grid density data """
     df = pd.read_excel(file_path, engine="odf")
-    if not all(col in df.columns for col in required_columns):
-        raise ValueError(f"Missing required columns in grid file. Needed: {required_columns}")
-    return df[required_columns].dropna()
+    df = df[["min_lat",	"max_lat",	"min_lon", "max_lon", "density_rank"]].dropna()
+    return df
 
 
 def read_stib_stops(file_path):
@@ -101,6 +96,7 @@ def read_poi_tags(file_path):
 
 def get_weather(city, date_time):
     """Fetches weather data for a given city and datetime."""
+
     base_forecast_url = "https://api.openweathermap.org/data/2.5/forecast"
     base_current_url = "https://api.openweathermap.org/data/2.5/weather"
 
@@ -119,16 +115,21 @@ def get_weather(city, date_time):
 
         if response.status_code == 200:
             data = response.json()
+
             # Find closest forecast time
             closest_forecast = min(data["list"],
                                    key=lambda x: abs(datetime.datetime.fromtimestamp(x["dt"]) - user_date))
+
             temperature = closest_forecast["main"]["temp"]
             weather_conditions = [weather["main"] for weather in closest_forecast["weather"]]
             is_raining = "Rain" in weather_conditions
+
             return temperature, is_raining
         else:
-            return None, None
+            return None, None  # Error in fetching forecast
+
     elif user_date.date() == today.date():
+        # Get current weather if the requested time is today
         params = {
             "q": city,
             "appid": API_KEY,
@@ -141,11 +142,13 @@ def get_weather(city, date_time):
             temperature = data["main"]["temp"]
             weather_conditions = [weather["main"] for weather in data["weather"]]
             is_raining = "Rain" in weather_conditions
+
             return temperature, is_raining
         else:
-            return None, None
+            return None, None  # Error in fetching current weather
+
     else:
-        return None, None
+        return None, None  # Past weather requires a paid plan
 
 
 def aggregate_poi_ranks(pois, tag_rank_mapping, tag_key='amenity'):
@@ -156,12 +159,13 @@ def aggregate_poi_ranks(pois, tag_rank_mapping, tag_key='amenity'):
             try:
                 total_rank += float(tag_rank_mapping[tag_value])
             except ValueError:
+                # If conversion fails, ignore this value.
                 pass
     return total_rank
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=100, tag_rank_mapping=None):
+def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=10, tag_rank_mapping=None):
+    # the filter is applied on the same key as poi_type.
     query = f"""
     [out:json];
     node[{poi_type}]
@@ -179,6 +183,7 @@ def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=100
         response.raise_for_status()
         data = response.json()
         pois = []
+
         for element in data['elements']:
             if 'tags' in element:
                 poi = {
@@ -189,15 +194,31 @@ def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=100
                     'tags': element['tags']
                 }
                 pois.append(poi)
-        popularity_total = aggregate_poi_ranks(pois, tag_rank_mapping, tag_key=poi_type) if tag_rank_mapping else None
+
+        # Optionally, aggregate the popularity rank values if mapping provided.
+        popularity_total = None
+        if tag_rank_mapping is not None:
+            popularity_total = aggregate_poi_ranks(pois, tag_rank_mapping, tag_key=poi_type)
+
+        # For demonstration, print first few POIs.
+        # for idx, poi in enumerate(pois[:5], 1):
+        #     print(f"{idx}. {poi['name']}")
+        #     print(f"   Coordinates: ({poi['latitude']}, {poi['longitude']})")
+        #     print(f"   {poi_type.capitalize()}: {poi['tags'].get(poi_type, 'N/A')}\n")
         return pois, popularity_total
+
     except requests.exceptions.RequestException as e:
         print(f"Error making API request: {e}")
         return [], 0
 
 
 def extract_grid_features(grid, pois_count, temperature, is_raining):
+
+    # Extract density rank from grid data.
+    # Use .get() to allow flexibility if grid is a dict; if it's a pd.Series, you could also use grid["density_rank"].
     density_rank = grid.get("density_rank", 0)
+
+    # Construct grid_data with geographic boundaries and density rank.
     grid_data = {
         "min_lat": grid.get("min_lat"),
         "max_lat": grid.get("max_lat"),
@@ -205,7 +226,12 @@ def extract_grid_features(grid, pois_count, temperature, is_raining):
         "max_lon": grid.get("max_lon"),
         "density_rank": density_rank,
     }
-    rain_val = 1 if is_raining else 0
+    if is_raining:
+        rain_val = 1
+    else:
+        rain_val=0
+
+    # Combine all features into a single dictionary.
     grid_features = {
         "grid_data": grid_data,
         "poi_score": pois_count,
@@ -213,11 +239,12 @@ def extract_grid_features(grid, pois_count, temperature, is_raining):
         "temp": temperature,
         "rain": rain_val
     }
+
     return grid_features
 
 
 def download_road_network(place_name):
-    logger.info(f"Downloading road network for {place_name}...")
+    print(f"Downloading road network data for {place_name}...")
 
     graph_ = ox.graph_from_place(place_name, network_type='drive', simplify=False)
 
@@ -249,8 +276,8 @@ def download_road_network(place_name):
 
 
 def validate_road_data(road_data):
-
     missing_info = []
+    # If input is a NetworkX graph:
     if isinstance(road_data, nx.Graph):
         try:
             nodes, edges = ox.graph_to_gdfs(road_data)
@@ -264,18 +291,24 @@ def validate_road_data(road_data):
     else:
         raise ValueError("road_data must be a NetworkX graph or a dict with 'nodes' and 'edges'.")
 
+    # Check for node identifier
     if 'osmid' not in nodes.columns and 'id' not in nodes.columns:
+        # Fallback: use the index as identifier and add a column
         nodes = nodes.copy()
         nodes['osmid'] = nodes.index
         print("Node identifier not found; using index as 'osmid'.")
 
+    # Ensure required node columns exist
     required_node_cols = ['geometry', 'x', 'y']
     for col in required_node_cols:
         if col not in nodes.columns:
             missing_info.append(f"Missing '{col}' in nodes.")
 
+    # For edges, check for 'u' and 'v'
     if 'u' not in edges.columns or 'v' not in edges.columns:
+        # Fallback: if edges index is a MultiIndex or tuple, try to extract u and v
         def extract_uv(row):
+            # If the index of the row is a tuple of length >=2, use its first two elements.
             if isinstance(row.name, tuple) and len(row.name) >= 2:
                 return pd.Series({'u': row.name[0], 'v': row.name[1]})
             else:
@@ -288,6 +321,7 @@ def validate_road_data(road_data):
             edges = edges.join(uv)
             print("Edge identifiers 'u' and 'v' were missing; inferred from index.")
 
+    # If any missing info remains, raise error with details.
     if missing_info:
         raise ValueError("Road data is missing required fields:\n" + "\n".join(missing_info))
 
@@ -295,216 +329,165 @@ def validate_road_data(road_data):
     return nodes, edges
 
 
-def load_model_and_scaler(model_path, scaler_path):
-    state_dict = torch.load(model_path)
-    if "predictor.weight" in state_dict:
-        state_dict["lin.weight"] = state_dict.pop("predictor.weight")
-        state_dict["lin.bias"] = state_dict.pop("predictor.bias")
-    if "conv1.lin.weight" in state_dict:
-        state_dict["conv1.lin_l.weight"] = state_dict.pop("conv1.lin.weight")
-        state_dict["conv1.lin_l.bias"] = state_dict.pop("conv1.bias")
-        state_dict["conv1.lin_r.weight"] = state_dict["conv1.lin_l.weight"]
-    if "conv2.lin.weight" in state_dict:
-        state_dict["conv2.lin_l.weight"] = state_dict.pop("conv2.lin.weight")
-        state_dict["conv2.lin_l.bias"] = state_dict.pop("conv2.bias")
-        state_dict["conv2.lin_r.weight"] = state_dict["conv2.lin_l.weight"]
+def normalize_features(grid_features):
+    def normalize_features(grid_features):
+        # Add 2 additional features (modify based on your actual data)
+        scalers = {
+            'density_rank': MinMaxScaler(feature_range=(0, 1)).fit([[1], [10]]),
+            'poi_score': MinMaxScaler(feature_range=(0, 1)).fit([[1], [1000]]),
+            'temp': MinMaxScaler(feature_range=(0, 1)).fit([[3], [10]]),
+            'rain': lambda x: x,
+            # Add 2 more features (example - modify as needed)
+            'population': MinMaxScaler(feature_range=(0, 1)).fit([[0], [1]]),
+            'employment': MinMaxScaler(feature_range=(0, 1)).fit([[0], [1]])
+        }
 
-    model = BusStopPredictor(in_channels=6, hidden_channels=64, out_channels=1)
-    model.load_state_dict(state_dict, strict=False)
+        return torch.tensor([
+            scalers['density_rank'].transform([[grid_features['density_rank']]])[0][0],
+            scalers['poi_score'].transform([[grid_features['poi_score']]])[0][0],
+            scalers['temp'].transform([[grid_features['temp']]])[0][0],
+            grid_features['rain'],
+            0.5,  # Placeholder for population (replace with real data)
+            0.5  # Placeholder for employment (replace with real data)
+        ], dtype=torch.float)
+
+
+def predict_stops(model, grid_data, road_graph, threshold=0.7):
     model.eval()
-    scaler = joblib.load(scaler_path)
-    return model, scaler
-
-
-def process_edges_and_predict(road_graph, city_grid_data, model, scaler, temperature, is_raining):
-    edges_gdf = ox.graph_to_gdfs(road_graph, nodes=False, edges=True)
-    edge_to_idx = {}
-    midpoints = []
-    features = []
-
-    # Create geometry for grid cells and set CRS explicitly to EPSG:4326
-    city_grid_data['geometry'] = city_grid_data.apply(
-        lambda row: box(row['min_lon'], row['min_lat'], row['max_lon'], row['max_lat']),
-        axis=1
-    )
-    grid_gdf = gpd.GeoDataFrame(city_grid_data, geometry='geometry', crs="EPSG:4326")
-
-    # Compute midpoints for each edge
-    edges_gdf['midpoint'] = edges_gdf['geometry'].apply(lambda x: x.interpolate(0.5, normalized=True))
-    midpoints_gdf = gpd.GeoDataFrame(geometry=edges_gdf['midpoint'], crs="EPSG:4326")
-
-    # Spatial join (CRS now matches, so no warning)
-    joined = gpd.sjoin(midpoints_gdf, grid_gdf, how='left', predicate='within')
-
-    # Process each edge to compute features
-    for idx, (_, edge) in enumerate(edges_gdf.iterrows()):
-        line = edge['geometry']
-        midpoint = line.interpolate(0.5, normalized=True)
-        midpoint_coords = (midpoint.y, midpoint.x)
-
-        # Determine the grid cell by checking if the midpoint falls inside
-        grid_cell = None
-        for _, grid in city_grid_data.iterrows():
-            if (grid['min_lat'] <= midpoint_coords[0] <= grid['max_lat'] and
-                    grid['min_lon'] <= midpoint_coords[1] <= grid['max_lon']):
-                grid_cell = grid
-                break
-        if grid_cell is None:
-            continue
-
-        # Try to obtain 'u', 'v', and 'key' for this edge
-        try:
-            u = edge['u']
-            v = edge['v']
-            key = edge['key']
-        except KeyError:
-            if isinstance(edge.name, tuple) and len(edge.name) >= 3:
-                u, v, key = edge.name[0], edge.name[1], edge.name[2]
-            else:
-                continue
-
-        # Save the index for this processed edge
-        edge_to_idx[(u, v, key)] = len(midpoints)
-
-        density_rank = grid_cell['density_rank']
-        poi_score = grid_cell['poi_score']
-        length = line.length
-        degree_u = road_graph.degree(u)
-        degree_v = road_graph.degree(v)
-        is_junction = 1 if (degree_u > 2 or degree_v > 2) else 0
-        rain = 1 if is_raining else 0
-        temp = temperature
-
-        feature_vector = [density_rank, poi_score, temp, rain, length, is_junction]
-        feature_normalized = scaler.transform([feature_vector])[0]
-        midpoints.append(midpoint_coords)
-        features.append(feature_normalized)
-
-    # Build adjacency solely for processed edges.
-    # Create a mapping from node to list of processed edge indices.
-    node_to_edges = defaultdict(list)
-    for (u, v, key), idx in edge_to_idx.items():
-        node_to_edges[u].append(idx)
-        node_to_edges[v].append(idx)
-
-    # For each node, all processed edges incident to that node are connected.
-    adjacency = defaultdict(set)
-    for node, indices in node_to_edges.items():
-        for i in range(len(indices)):
-            for j in range(i + 1, len(indices)):
-                adjacency[indices[i]].add(indices[j])
-                adjacency[indices[j]].add(indices[i])
-
-    # Build the final edge_index tensor
-    edge_index_list = [[src, dest] for src in adjacency for dest in adjacency[src]]
-    edge_index = torch.tensor(edge_index_list, dtype=torch.long).t().contiguous()
-    x = torch.tensor(features, dtype=torch.float)
-    data = Data(x=x, edge_index=edge_index)
-
     with torch.no_grad():
-        output = model(data.x, data.edge_index)
-    probabilities = torch.sigmoid(output.squeeze()).numpy()
+        # Convert road network to PyG Data
+        pyg_data = from_networkx(road_graph)
+        pyg_data.x = normalize_features(grid_data).repeat(pyg_data.num_nodes, 1)
 
-    return midpoints, features, probabilities
+        # Make prediction
+        pred = model(pyg_data.x, pyg_data.edge_index)
 
+    # Get candidate positions (filter junctions and non-drivable roads)
+    candidates = []
+    for node in road_graph.nodes():
+        if road_graph.nodes[node].get('highway') in ['primary', 'secondary', 'tertiary']:
+            point = Point(road_graph.nodes[node]['x'], road_graph.nodes[node]['y'])
+            buffer = point.buffer(JUNCTION_BUFFER)
 
-def filter_and_save_predictions(midpoints, features, probabilities, output_file="Model Data/predicted_stops.ods"):
-    selected = []
-    candidates = [
-        (i, prob, lat, lon)
-        for i, (prob, (lat, lon)) in enumerate(zip(probabilities, midpoints))
-        if prob > 0.5 and features[i][5] == 0
-    ]
+            # Check if near junction
+            is_junction = False
+            for edge in road_graph.edges():
+                if node in edge[:2]:
+                    if len(list(road_graph.successors(node))) > 2:
+                        is_junction = True
+                        break
 
-    selected = []
-    coordinates = []
-    for i, prob, lat, lon in sorted(candidates, key=lambda x: -x[1]):
-        coord_rad = np.radians([[lat, lon]])
-        if any(haversine_distances(coord_rad, np.radians([c]))[0][0] * 6371000 < 500 for c in coordinates):
-            continue
-        selected.append(i)
-        coordinates.append([lat, lon])
+            if not is_junction and pred[node] > threshold:
+                candidates.append({
+                    'lat': road_graph.nodes[node]['y'],
+                    'lon': road_graph.nodes[node]['x'],
+                    'score': pred[node].item()
+                })
 
-    for i, prob in enumerate(probabilities):
-        is_junction = features[i][5]
-        if prob > 0.5 and is_junction == 0:
-            selected.append(i)
-
-    selected_midpoints = [(midpoints[i][0], midpoints[i][1]) for i in selected]
-    df = pd.DataFrame(selected_midpoints, columns=['latitude', 'longitude'])
-    df.to_excel(output_file, engine="odf")
-
-    m = folium.Map(location=[midpoints[0][0], midpoints[0][1]], zoom_start=12)
-    for lat, lon in selected_midpoints:
-        folium.Marker([lat, lon], icon=folium.Icon(color='green')).add_to(m)
-    m.save("Template/bus_stops_map.html")
-    return df
+    return candidates
 
 
-def validate_predictions(predicted_gdf: gpd.GeoDataFrame, existing_stops_gdf: gpd.GeoDataFrame):
-    """Compare predictions with existing stops"""
-    buffer_distance = 50  # meters
-    existing_buffers = existing_stops_gdf.buffer(buffer_distance / 111000)
-    matched = predicted_gdf.geometry.apply(
-        lambda x: any(x.distance(existing) < buffer_distance for existing in existing_buffers)
-    )
+def save_predictions(predictions, filename):
+    df = pd.DataFrame(predictions)
+    df.to_excel(filename, engine="odf")
+    print(f"Predictions saved to {filename}")
 
-    logger.info(f"Prediction validation:")
-    logger.info(f"Total predictions: {len(predicted_gdf)}")
-    logger.info(f"Matching existing stops: {matched.sum()} ({matched.mean():.1%})")
-    return matched
+
+def load_pretrained_model(path):
+    # Load with correct architecture
+    model = BusStopPredictor()
+    pretrained_dict = torch.load(path)
+
+    # Remove 'module.' prefixes if present (from DataParallel)
+    pretrained_dict = {k.replace('module.', ''): v
+                       for k, v in pretrained_dict.items()}
+
+    # Load modified state dict
+    model.load_state_dict(pretrained_dict)
+    return model
+
+
+def create_map(predictions, city_center):
+    m = folium.Map(location=city_center, zoom_start=12)
+
+    for idx, stop in enumerate(predictions):
+        folium.Marker(
+            location=[stop['lat'], stop['lon']],
+            popup=f"Score: {stop['score']:.2f}",
+            icon=folium.Icon(color='green' if stop['score'] > 0.7 else 'orange')
+        ).add_to(m)
+
+    return m
 
 
 def main():
+    global features
     city_grid_data = read_city_grid(GRID_FILE)
     stib_stops_data = read_stib_stops(STOPS_FILE)
     poi_names, poi_ranks = read_poi_tags(POI_TAGS_FILE)
     tag_rank_mapping = dict(zip(poi_names, poi_ranks))
     temperature, is_raining = get_weather(CITY_NAME, DATE_TIME)
 
-    poi_scores = []
-    for _, grid in city_grid_data.iterrows():
+    road_ = download_road_network(CITY_NAME)
 
-        pois, poi_count = get_pois(
-            grid["min_lat"], grid["min_lon"],
-            grid["max_lat"], grid["max_lon"],
-            'amenity', tag_rank_mapping=tag_rank_mapping
-        )
+    # Load pretrained model
+    model = load_pretrained_model(MODEL_SAVE_PATH)
+    model.eval()
 
-        poi_scores.append(poi_count)
-    city_grid_data['poi_score'] = poi_scores
-
-    road_graph = download_road_network(CITY_NAME)
-    road_nodes, road_edges = validate_road_data(road_graph)
-
-    model, scaler = load_model_and_scaler(MODEL_SAVE_PATH, "Output/bus_stop_scaler.pkl")
-
-    midpoints, features, probabilities = process_edges_and_predict(
-        road_graph, city_grid_data, model, scaler, temperature, is_raining
-    )
-
-    df_predictions = filter_and_save_predictions(midpoints, features, probabilities)
-    print("Predictions saved to predicted_stops.ods and map.html")
-
-    if temperature is not None:
-        print(f"\nWeather in {CITY_NAME} on {DATE_TIME}:")
-        print(f"Temperature: {temperature}°C")
-        print(f"Raining: {'Yes' if is_raining else 'No'}")
-    else:
-        print("\nError: Unable to fetch weather for this date (historical data requires a paid plan).")
-
-    print("City Grid Data Sample:")
-    print(city_grid_data.head())
-
-    print("\nSTIB Stops Data Sample:")
-    print(stib_stops_data.head())
-
-    print("POI Names:")
-    print(poi_names[:5])
-
-    print("\nPOI Ranks:")
-    print(poi_ranks[:5])
-
+    # # Get city center for map
+    # city_center = [city_grid_data['min_lat'].mean(), city_grid_data['min_lon'].mean()]
+    #
+    # all_predictions = []
+    # for _, grid in city_grid_data.iterrows():
+    #     pois, poi_count = get_pois(
+    #         grid["min_lat"], grid["min_lon"],
+    #         grid["max_lat"], grid["max_lon"],
+    #         'amenity', tag_rank_mapping=tag_rank_mapping
+    #     )
+    #
+    #     grid_features = extract_grid_features(grid, poi_count, temperature, is_raining)
+    #     print(grid_features)
+    #
+    #     # Predict stops for this grid
+    #     candidates = predict_stops(model, grid_features, road_)
+    #
+    #     # Add grid info to predictions
+    #     for candidate in candidates:
+    #         candidate.update({
+    #             'grid_min_lat': grid['min_lat'],
+    #             'grid_max_lat': grid['max_lat'],
+    #             'grid_min_lon': grid['min_lon'],
+    #             'grid_max_lon': grid['max_lon']
+    #         })
+    #
+    #     all_predictions.extend(candidates)
+    #
+    #
+    # if temperature is not None:
+    #     print(f"\nWeather in {CITY_NAME} on {DATE_TIME}:")
+    #     print(f"Temperature: {temperature}°C")
+    #     print(f"Raining: {'Yes' if is_raining else 'No'}")
+    # else:
+    #     print("\nError: Unable to fetch weather for this date (historical data requires a paid plan).")
+    #
+    # # Save and visualize
+    # save_predictions(all_predictions, "Model Data/bus_stop_predictions.ods")
+    # map = create_map(all_predictions, city_center)
+    # map.save("Template/bus_stops_prediction_map.html")
+    #
+    # print("Prediction complete. Check .ods file and .html map")
+    #
+    # print("City Grid Data Sample:")
+    # print(city_grid_data.head())
+    #
+    # print("\nSTIB Stops Data Sample:")
+    # print(stib_stops_data.head())
+    #
+    # print("POI Names:")
+    # print(poi_names[:5])
+    #
+    # print("\nPOI Ranks:")
+    # print(poi_ranks[:5])
 
 if __name__ == "__main__":
     main()
