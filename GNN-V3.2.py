@@ -330,26 +330,26 @@ def validate_road_data(road_data):
 
 
 def normalize_features(grid_features):
-    def normalize_features(grid_features):
-        # Add 2 additional features (modify based on your actual data)
-        scalers = {
-            'density_rank': MinMaxScaler(feature_range=(0, 1)).fit([[1], [10]]),
-            'poi_score': MinMaxScaler(feature_range=(0, 1)).fit([[1], [1000]]),
-            'temp': MinMaxScaler(feature_range=(0, 1)).fit([[3], [10]]),
-            'rain': lambda x: x,
-            # Add 2 more features (example - modify as needed)
-            'population': MinMaxScaler(feature_range=(0, 1)).fit([[0], [1]]),
-            'employment': MinMaxScaler(feature_range=(0, 1)).fit([[0], [1]])
-        }
+    # Add 2 additional features (modify based on your actual data)
+    scalers = {
+        'density_rank': MinMaxScaler(feature_range=(0, 1)).fit([[1], [10]]),
+        'poi_score': MinMaxScaler(feature_range=(0, 1)).fit([[1], [1000]]),
+        'temp': MinMaxScaler(feature_range=(0, 1)).fit([[3], [10]]),
+        'rain': lambda x: x,
+        # Add 2 more features (example - modify as needed)
+        'population': MinMaxScaler(feature_range=(0, 1)).fit([[0], [1]]),
+        'employment': MinMaxScaler(feature_range=(0, 1)).fit([[0], [1]])
+    }
 
-        return torch.tensor([
-            scalers['density_rank'].transform([[grid_features['density_rank']]])[0][0],
-            scalers['poi_score'].transform([[grid_features['poi_score']]])[0][0],
-            scalers['temp'].transform([[grid_features['temp']]])[0][0],
-            grid_features['rain'],
-            0.5,  # Placeholder for population (replace with real data)
-            0.5  # Placeholder for employment (replace with real data)
-        ], dtype=torch.float)
+    return torch.tensor([
+        grid_features['density_rank'] / 10,
+        grid_features['poi_score'] / 1000,
+        (grid_features['temp'] - 3) / 7,  # 3-10°C normalization
+        grid_features['rain'],
+        # Add 2 real features (e.g., population/employment data)
+        0.5,  # Placeholder 1
+        0.5   # Placeholder 2
+    ], dtype=torch.float)
 
 
 def predict_stops(model, grid_data, road_graph, threshold=0.7):
@@ -394,16 +394,32 @@ def save_predictions(predictions, filename):
 
 
 def load_pretrained_model(path):
-    # Load with correct architecture
     model = BusStopPredictor()
     pretrained_dict = torch.load(path)
 
-    # Remove 'module.' prefixes if present (from DataParallel)
-    pretrained_dict = {k.replace('module.', ''): v
-                       for k, v in pretrained_dict.items()}
+    # Handle DataParallel prefixes if present
+    pretrained_dict = {k.replace('module.', ''): v for k, v in pretrained_dict.items()}
 
-    # Load modified state dict
-    model.load_state_dict(pretrained_dict)
+    # Key mapping for SAGEConv components
+    key_mapping = {
+        'conv1.lin.weight': 'conv1.lin_l.weight',
+        'conv1.bias': 'conv1.lin_l.bias',
+        'conv2.lin.weight': 'conv2.lin_l.weight',
+        'conv2.bias': 'conv2.lin_l.bias',
+        # Add batch norm mappings if needed
+        'bn1.weight': 'bn1.module.weight',
+        'bn1.bias': 'bn1.module.bias'
+    }
+
+    aligned_dict = {}
+    for key in model.state_dict():
+        src_key = key_mapping.get(key, key)
+        if src_key in pretrained_dict:
+            aligned_dict[key] = pretrained_dict[src_key]
+        else:
+            aligned_dict[key] = model.state_dict()[key]  # Initialize missing params
+
+    model.load_state_dict(aligned_dict, strict=False)
     return model
 
 
@@ -434,17 +450,17 @@ def main():
     model = load_pretrained_model(MODEL_SAVE_PATH)
     model.eval()
 
-    # # Get city center for map
-    # city_center = [city_grid_data['min_lat'].mean(), city_grid_data['min_lon'].mean()]
-    #
-    # all_predictions = []
-    # for _, grid in city_grid_data.iterrows():
-    #     pois, poi_count = get_pois(
-    #         grid["min_lat"], grid["min_lon"],
-    #         grid["max_lat"], grid["max_lon"],
-    #         'amenity', tag_rank_mapping=tag_rank_mapping
-    #     )
-    #
+    # Get city center for map
+    city_center = [city_grid_data['min_lat'].mean(), city_grid_data['min_lon'].mean()]
+
+    all_predictions = []
+    for _, grid in city_grid_data.iterrows():
+        pois, poi_count = get_pois(
+            grid["min_lat"], grid["min_lon"],
+            grid["max_lat"], grid["max_lon"],
+            'amenity', tag_rank_mapping=tag_rank_mapping
+        )
+        print(poi_count)
     #     grid_features = extract_grid_features(grid, poi_count, temperature, is_raining)
     #     print(grid_features)
     #
