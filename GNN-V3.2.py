@@ -164,7 +164,7 @@ def aggregate_poi_ranks(pois, tag_rank_mapping, tag_key='amenity'):
     return total_rank
 
 
-def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=10, tag_rank_mapping=None):
+def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=50, tag_rank_mapping=None):
     # the filter is applied on the same key as poi_type.
     query = f"""
     [out:json];
