@@ -1,534 +1,430 @@
-import json
+import datetime
 import pandas as pd
-import geopandas as gpd
-import numpy as np
-import folium
+import json
 import requests
 import torch
-import torch.nn.functional as F
-from torch_geometric.nn import GCNConv
-from shapely.geometry import Point, box, Polygon
-from datetime import datetime
-from sklearn.preprocessing import StandardScaler
-import pytz
+import numpy as np
 import osmnx as ox
-from tqdm import tqdm
-import logging
-from typing import Dict, List, Tuple
-from pathlib import Path
-import warnings
-from odf.opendocument import OpenDocumentSpreadsheet
-from odf.table import Table, TableRow, TableCell
-from odf.text import P
+from torch_geometric.data import Data
+from torch_geometric.nn import SAGEConv, BatchNorm
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from shapely.geometry import Point, LineString, Polygon
+import networkx as nx
+import geopandas as gpd
+import folium
+from openpyxl import Workbook
+import pickle
 
-# Suppress warnings
-warnings.filterwarnings('ignore')
+# Load API keys
+with open('api_keys.json') as json_file:
+    api_keys = json.load(json_file)
+API_KEY = api_keys['Weather_API']['API_key']
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
 
-# OSMnx configuration
-ox.settings.log_console = True
-ox.settings.use_cache = True
-ox.settings.timeout = 300
-
-# Configuration constants
-CONFIG = {
-    "model_params": {
-        "hidden_channels": 32,
-        "learning_rate": 0.01,
-        "epochs": 500,
-        "dropout": 0.5
-    },
-    "proximity_threshold": 0.00045,  # ~50 meters
-    "max_candidates_per_grid": 5,
-    "output_dir": "Output",
-    # Add default POI weights
-    "default_poi_weights": {
-        "amenity": {
-            "hospital": 5,
-            "school": 4,
-            "university": 4,
-            "bus_station": 5
-        },
-        "shop": {
-            "supermarket": 3,
-            "mall": 4
-        },
-        "public_transport": {
-            "station": 4
-        }
-    }
-}
-
-# Create Output directory
-Path(CONFIG["output_dir"]).mkdir(parents=True, exist_ok=True)
+# Constants
+CITY_NAME = "Brussels"
+DATE_TIME = "2025-02-15 11:00"
+GRID_FILE = "Training Data/city_grid_density.ods"
+STOPS_FILE = "Training Data/stib_stops.ods"
+POI_TAGS_FILE = "poi_tags.json"
+MODEL_SAVE_PATH = "bus_stop_predictor.pkl"  # Updated to .pkl
+JUNCTION_BUFFER = 50  # meters
+CELL_SIZE = 500  # meters
 
 
-class EnhancedGNN(torch.nn.Module):
-    """Graph Neural Network for bus stop prediction"""
-
-    def __init__(self, in_channels: int, hidden_channels: int, dropout: float = 0.5):
-        super().__init__()
-        self.conv1 = GCNConv(in_channels, hidden_channels)
-        self.conv2 = GCNConv(hidden_channels, hidden_channels)
-        self.lin = torch.nn.Linear(hidden_channels, 1)
-        self.dropout = torch.nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.conv1(x, edge_index))
-        x = self.dropout(x)
-        x = self.conv2(x, edge_index)
-        return torch.sigmoid(self.lin(x))
+# Existing functions from the user's code (unchanged)
+def read_city_grid(file_path):
+    df = pd.read_excel(file_path, engine="odf")
+    df = df[["min_lat", "max_lat", "min_lon", "max_lon", "density_rank"]].dropna()
+    return df
 
 
-class DataLoader:
-    """Handles data loading and preprocessing"""
-
-    @staticmethod
-    def load_grid_data(file_path: str) -> pd.DataFrame:
-        """Load and validate grid data"""
-        try:
-            df = pd.read_excel(file_path, engine='odf')
-            df = df.rename(columns={'density_rank': 'population_density'})
-
-            # Validate columns
-            required_columns = ['min_lat', 'min_lon', 'max_lat', 'max_lon', 'population_density']
-            if not all(col in df.columns for col in required_columns):
-                raise ValueError(f"Missing required columns: {required_columns}")
-
-            # Coordinate validation and normalization
-            for lat_col in ['min_lat', 'max_lat']:
-                df[lat_col] = df[lat_col].clip(-90, 90)
-            for lon_col in ['min_lon', 'max_lon']:
-                df[lon_col] = df[lon_col].clip(-180, 180)
-
-            # Ensure proper coordinate order
-            df['min_lat'], df['max_lat'] = np.where(
-                df['min_lat'] < df['max_lat'],
-                (df['min_lat'], df['max_lat']),
-                (df['max_lat'], df['min_lat'])
-            )
-            df['min_lon'], df['max_lon'] = np.where(
-                df['min_lon'] < df['max_lon'],
-                (df['min_lon'], df['max_lon']),
-                (df['max_lon'], df['min_lon'])
-            )
-
-            # Data validation
-            valid = (
-                    (df['min_lat'] < df['max_lat']) &
-                    (df['min_lon'] < df['max_lon']) &
-                    (df['population_density'].between(1, 5))
-            )
-            df = df[valid].reset_index(drop=True)
-
-            if df.empty:
-                raise ValueError("No valid grids after processing")
-
-            logger.info(f"Loaded {len(df)} valid grids")
-            return df
-
-        except Exception as e:
-            logger.error(f"Error loading grid data: {str(e)}")
-            raise
-
-    @staticmethod
-    def load_poi_config(file_path: str) -> Dict:
-        """Load POI configuration with proper error handling"""
-        try:
-            with open(file_path, "r") as f:
-                poi_config = json.load(f)
-
-            if not isinstance(poi_config, dict):
-                raise ValueError("POI config should be a dictionary")
-
-            # Validate structure
-            if not all(isinstance(v, dict) for v in poi_config.values()):
-                raise ValueError("Invalid POI config structure")
-
-            return poi_config
-        except Exception as e:
-            logger.error(f"Using default POI config: {str(e)}")
-            return CONFIG["default_poi_weights"]
+def read_stib_stops(file_path):
+    df = pd.read_excel(file_path, engine="odf")
+    df = df[["stop_lat", "stop_lon", "stop_name"]].dropna()
+    return df
 
 
-class POIProcessor:
-    """Handles POI data processing and counting"""
+def read_poi_tags(file_path):
+    with open(file_path, "r") as f:
+        poi_data = json.load(f)
+    poi_names = []
+    poi_ranks = []
+    for category in poi_data:
+        for name, rank in poi_data[category].items():
+            poi_names.append(name)
+            poi_ranks.append(rank)
+    return poi_names, poi_ranks
 
-    def __init__(self, poi_config: Dict):
-        self.poi_config = poi_config
-        self.all_poi_types = self._get_all_poi_types()
 
-    def _get_all_poi_types(self) -> List[str]:
-        """Get list of all POI types from config"""
-        return list({
-            poi_type
-            for category in self.poi_config.values()
-            for poi_type in category.keys()
-        })
+def get_weather(city, date_time):
+    base_forecast_url = "https://api.openweathermap.org/data/2.5/forecast"
+    base_current_url = "https://api.openweathermap.org/data/2.5/weather"
+    user_date = datetime.datetime.strptime(date_time, "%Y-%m-%d %H:%M")
+    today = datetime.datetime.now()
+    if user_date >= today and (user_date - today).days <= 5:
+        params = {"q": city, "appid": API_KEY, "units": "metric"}
+        response = requests.get(base_forecast_url, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            closest_forecast = min(data["list"],
+                                   key=lambda x: abs(datetime.datetime.fromtimestamp(x["dt"]) - user_date))
+            temperature = closest_forecast["main"]["temp"]
+            weather_conditions = [weather["main"] for weather in closest_forecast["weather"]]
+            is_raining = "Rain" in weather_conditions
+            return temperature, is_raining
+        else:
+            return None, None
+    elif user_date.date() == today.date():
+        params = {"q": city, "appid": API_KEY, "units": "metric"}
+        response = requests.get(base_current_url, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            temperature = data["main"]["temp"]
+            weather_conditions = [weather["main"] for weather in data["weather"]]
+            is_raining = "Rain" in weather_conditions
+            return temperature, is_raining
+        else:
+            return None, None
+    else:
+        return None, None
 
-    def count_pois(self, pois: List[Dict]) -> Dict[str, int]:
-        """Count occurrences of each POI type in a grid"""
-        counts = {poi_type: 0 for poi_type in self.all_poi_types}
 
-        for poi in pois:
-            for category, tags in self.poi_config.items():
-                if category in poi['tags']:
-                    tag_value = poi['tags'][category]
-                    if tag_value in tags:
-                        counts[tag_value] += 1
-        return counts
-
-    def calculate_poi_score(self, pois: List[Dict]) -> int:
-        """Calculate weighted POI score using OSM tags"""
-        if not isinstance(pois, list):
-            return 0
-
-        score = 0
-        for poi in pois:
-            for category, tags in self.poi_config.items():
-                # Check if POI has this category tag and it matches our configuration
-                if category in poi['tags']:
-                    tag_value = poi['tags'][category]
-                    if tag_value in tags:
-                        score += tags[tag_value]
-        return score
-
-    def fetch_pois(self, grid: Dict) -> List[Dict]:
-        """Fetch POIs for a grid using OSMnx-compatible syntax"""
-        try:
-            # Define bounding box as (north, south, east, west)
-            bbox = (
-                grid['max_lat'],  # North
-                grid['min_lat'],  # South
-                grid['max_lon'],  # East
-                grid['min_lon']  # West
-            )
-
-            # Convert POI config to OSMnx-compatible format
-            osm_tags = {
-                category: list(poi_types.keys())
-                for category, poi_types in self.poi_config.items()
-            }
-
-            # Fetch POIs with corrected parameter order
-            pois_gdf = ox.features.features_from_bbox(
-                *bbox,  # Unpack bbox tuple
-                tags=osm_tags
-            )
-            return self._process_pois(pois_gdf, grid)
-        except Exception as e:
-            logger.error(f"POI fetch error: {str(e)}")
-            return []
-
-    def _process_pois(self, pois_gdf: gpd.GeoDataFrame, grid: Dict) -> List[Dict]:
-        """Process raw POI data"""
-        pois = []
-        for _, row in pois_gdf.iterrows():
+def aggregate_poi_ranks(pois, tag_rank_mapping, tag_key='amenity'):
+    total_rank = 0
+    for poi in pois:
+        tag_value = poi.get('tags', {}).get(tag_key)
+        if tag_value and tag_value in tag_rank_mapping:
             try:
-                geom = row.geometry
-                if geom.geom_type not in ['Point', 'Polygon']:
-                    continue
+                total_rank += float(tag_rank_mapping[tag_value])
+            except ValueError:
+                pass
+    return total_rank
 
-                poi_data = {
-                    'lat': geom.centroid.y if geom.geom_type == 'Polygon' else geom.y,
-                    'lon': geom.centroid.x if geom.geom_type == 'Polygon' else geom.x,
-                    'tags': {k: v for k, v in row.items() if k in self.poi_config}
+
+def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=10, tag_rank_mapping=None):
+    query = f"""
+    [out:json];
+    node[{poi_type}]
+      ["{poi_type}"!="bench"]
+      ["{poi_type}"!="recycle"]
+      ["{poi_type}"!="waste_basket"]
+      ["{poi_type}"!="bicycle_parking"]
+      ({min_lat},{min_lon},{max_lat},{max_lon});
+    out body;
+    """
+    url = "https://overpass-api.de/api/interpreter"
+    try:
+        response = requests.post(url, data={'data': query}, timeout=timeout)
+        response.raise_for_status()
+        data = response.json()
+        pois = []
+        for element in data['elements']:
+            if 'tags' in element:
+                poi = {
+                    'name': element['tags'].get('name', 'Unnamed POI'),
+                    'latitude': element['lat'],
+                    'longitude': element['lon'],
+                    'type': poi_type,
+                    'tags': element['tags']
                 }
-                pois.append(poi_data)
-            except Exception as e:
-                logger.warning(f"Error processing POI: {str(e)}")
-        return pois
+                pois.append(poi)
+        popularity_total = None
+        if tag_rank_mapping is not None:
+            popularity_total = aggregate_poi_ranks(pois, tag_rank_mapping, tag_key=poi_type)
+        return pois, popularity_total
+    except requests.exceptions.RequestException as e:
+        print(f"Error making API request: {e}")
+        return [], 0
 
 
-class GNNTrainer:
-    """Handles GNN training"""
-
-    def __init__(self, in_channels: int, config: Dict):
-        self.model = EnhancedGNN(
-            in_channels=in_channels,
-            hidden_channels=config["hidden_channels"],
-            dropout=config["dropout"]
-        )
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(),
-            lr=config["learning_rate"],
-            weight_decay=1e-4
-        )
-        self.epochs = config["epochs"]
-
-    def train(self, X: torch.Tensor, edge_index: torch.Tensor, y: torch.Tensor) -> EnhancedGNN:
-        """Train the GNN model"""
-        self.model.train()
-        pbar = tqdm(range(self.epochs), desc="Training GNN")
-
-        for epoch in pbar:
-            self.optimizer.zero_grad()
-            out = self.model(X, edge_index).squeeze()
-            loss = F.mse_loss(out, y)
-            loss.backward()
-            self.optimizer.step()
-
-            pbar.set_postfix({"Loss": loss.item()})
-        return self.model
+def download_road_network(place_name):
+    print(f"Downloading road network data for {place_name}...")
+    graph_ = ox.graph_from_place(place_name, network_type='drive', simplify=False)
+    nodes = ox.graph_to_gdfs(graph_, nodes=True, edges=False)
+    north, south, east, west = nodes.union_all().bounds
+    radius = 0.1
+    expanded_north = north + radius
+    expanded_south = south - radius
+    expanded_east = east + radius
+    expanded_west = west - radius
+    expanded_graph_ = ox.graph_from_bbox((expanded_north, expanded_south, expanded_east, expanded_west),
+                                         network_type='drive', simplify=False)
+    for node_id in expanded_graph_.nodes():
+        expanded_graph_.nodes[node_id]['osmid'] = node_id
+    u_values = {(u, v, k): u for u, v, k in expanded_graph_.edges(keys=True)}
+    v_values = {(u, v, k): v for u, v, k in expanded_graph_.edges(keys=True)}
+    nx.set_edge_attributes(expanded_graph_, u_values, 'u')
+    nx.set_edge_attributes(expanded_graph_, v_values, 'v')
+    return expanded_graph_
 
 
-class SpatialProcessor:
-    """Handles spatial operations"""
-
-    @staticmethod
-    def create_spatial_graph(grids: pd.DataFrame) -> torch.Tensor:
-        """Create graph edges based on grid centroids"""
-        centroids = grids.apply(lambda row: [
-            (row['min_lat'] + row['max_lat']) / 2,
-            (row['min_lon'] + row['max_lon']) / 2
-        ], axis=1).tolist()
-
-        edges = []
-        for i in range(len(centroids)):
-            for j in range(i + 1, len(centroids)):
-                if np.linalg.norm(np.array(centroids[i]) - np.array(centroids[j])) < 0.02:
-                    edges.extend([[i, j], [j, i]])
-
-        return torch.tensor(edges, dtype=torch.long).t().contiguous() if edges else torch.empty((2, 0),
-                                                                                                dtype=torch.long)
-
-    @staticmethod
-    def generate_candidates(grid: pd.Series) -> List[Dict]:
-        """Generate candidate bus stop locations"""
+def validate_road_data(road_data):
+    missing_info = []
+    if isinstance(road_data, nx.Graph):
         try:
-            roads = ox.graph_from_bbox(
-                grid['max_lat'], grid['min_lat'],
-                grid['max_lon'], grid['min_lon'],
-                network_type='drive'
-            )
-            edges = ox.graph_to_gdfs(roads, nodes=False)
-            candidates = []
-
-            for _, edge in edges.iterrows():
-                if 'geometry' in edge and edge.geometry.length > 0.0001:
-                    for dist in np.linspace(0.1, 0.9, 5):
-                        point = edge.geometry.interpolate(dist, normalized=True)
-                        candidates.append({
-                            'lat': point.y,
-                            'lon': point.x,
-                            'grid_id': grid.name
-                        })
-            return candidates[:CONFIG["max_candidates_per_grid"]]
+            nodes, edges = ox.graph_to_gdfs(road_data)
         except Exception as e:
-            logger.error(f"Candidate generation error: {str(e)}")
-            return []
+            raise ValueError(f"Error converting graph to GeoDataFrames: {e}")
+    else:
+        raise ValueError("road_data must be a NetworkX graph.")
+    if 'osmid' not in nodes.columns and 'id' not in nodes.columns:
+        nodes = nodes.copy()
+        nodes['osmid'] = nodes.index
+        print("Node identifier not found; using index as 'osmid'.")
+    required_node_cols = ['geometry', 'x', 'y']
+    for col in required_node_cols:
+        if col not in nodes.columns:
+            missing_info.append(f"Missing '{col}' in nodes.")
+    if 'u' not in edges.columns or 'v' not in edges.columns:
+        def extract_uv(row):
+            if isinstance(row.name, tuple) and len(row.name) >= 2:
+                return pd.Series({'u': row.name[0], 'v': row.name[1]})
+            else:
+                return pd.Series({'u': None, 'v': None})
+
+        uv = edges.apply(extract_uv, axis=1)
+        if uv['u'].isna().all() or uv['v'].isna().all():
+            missing_info.append("Missing 'u' and 'v' in edges and could not be inferred.")
+        else:
+            edges = edges.join(uv)
+            print("Edge identifiers 'u' and 'v' were missing; inferred from index.")
+    if missing_info:
+        raise ValueError("Road data is missing required fields:\n" + "\n".join(missing_info))
+    print("Road data validation passed.")
+    return nodes, edges
 
 
-class OutputGenerator:
-    """Handles Output generation"""
+# New functions for GNN prediction
 
-    @staticmethod
-    def save_to_ods(data: pd.DataFrame, filename: str):
-        """Save data to ODS file"""
-        try:
-            doc = OpenDocumentSpreadsheet()
-            table = Table(name="BusStops")
+def normalize_features(density, poi_count, temperature, rain):
+    """Normalize features based on specified ranges."""
+    density_norm = (density - 1) / 9  # 1-10 to [0,1]
+    poi_norm = (poi_count - 1) / 999  # 1-1000 to [0,1]
+    if temperature < 3:
+        temp_norm = 0  # Bad
+    elif 3 <= temperature <= 10:
+        temp_norm = (temperature - 3) / 7  # Average, map 3-10 to [0,1]
+    else:
+        temp_norm = 1  # Good
+    rain_norm = rain  # Already 0 or 1 (0 = no rain, 1 = raining)
+    return np.array([density_norm, poi_norm, temp_norm, rain_norm])
 
-            # Create header
-            tr = TableRow()
-            for col in data.columns:
-                tc = TableCell()
-                tc.addElement(P(text=col))
-                tr.addElement(tc)
-            table.addElement(tr)
 
-            # Add data rows
-            for _, row in data.iterrows():
-                tr = TableRow()
-                for val in row:
-                    tc = TableCell()
-                    tc.addElement(P(text=str(val)))
-                    tr.addElement(tc)
-                table.addElement(tr)
+def construct_graph(road_nodes, road_edges, grid, features):
+    """Construct a PyTorch Geometric graph for a specific grid."""
+    # Filter edges within the grid
+    grid_polygon = Polygon([
+        (grid['min_lon'], grid['min_lat']),
+        (grid['min_lon'], grid['max_lat']),
+        (grid['max_lon'], grid['max_lat']),
+        (grid['max_lon'], grid['min_lat'])
+    ])
+    edges_gdf = gpd.GeoDataFrame(road_edges, geometry='geometry')
+    edges_in_grid = edges_gdf[edges_gdf.intersects(grid_polygon)].copy()
 
-            doc.spreadsheet.addElement(table)
-            doc.save(f"{CONFIG['output_dir']}/{filename}")
-            logger.info(f"Saved ODS file: {filename}")
-        except Exception as e:
-            logger.error(f"Error saving ODS file: {str(e)}")
+    # Create a subgraph
+    G = nx.Graph()
+    for _, edge in edges_in_grid.iterrows():
+        u, v = edge['u'], edge['v']
+        G.add_edge(u, v, length=edge['length'], speed_limit=edge.get('maxspeed', 50))
 
-    @staticmethod
-    def create_map(data: pd.DataFrame, grids: pd.DataFrame, filename: str):
-        """Create interactive Folium map"""
-        try:
-            m = folium.Map(
-                location=[data['lat'].mean(), data['lon'].mean()],
-                zoom_start=13,
-                tiles='CartoDB positron'
-            )
+    # Add nodes and features
+    node_list = list(G.nodes())
+    if not node_list:
+        return None  # No nodes in this grid
 
-            # Add bus stops
-            for _, row in data.iterrows():
-                folium.Marker(
-                    [row['lat'], row['lon']],
-                    popup=f"Grid {row['grid_id']} - Score: {row['score']}",
-                    icon=folium.Icon(color='green', icon='bus', prefix='fa')
-                ).add_to(m)
+    # Map nodes to indices
+    node_to_idx = {node: idx for idx, node in enumerate(node_list)}
 
-            # Add grid boundaries
-            for _, grid in grids.iterrows():
-                folium.Rectangle(
-                    bounds=[
-                        [grid['min_lat'], grid['min_lon']],
-                        [grid['max_lat'], grid['max_lon']]
-                    ],
-                    color='#ff7800',
-                    fill=True,
-                    fill_color='#ffff00',
-                    fill_opacity=0.2
-                ).add_to(m)
+    # Edge index for PyTorch Geometric
+    edge_index = torch.tensor(
+        [[node_to_idx[u], node_to_idx[v]] for u, v in G.edges()],
+        dtype=torch.long
+    ).t().contiguous()
 
-            m.save(f"{CONFIG['output_dir']}/{filename}")
-            logger.info(f"Saved map: {filename}")
-        except Exception as e:
-            logger.error(f"Error creating map: {str(e)}")
+    # Node features: [length, speed_limit, density, poi, temp, rain]
+    x = []
+    for node in node_list:
+        connected_edges = list(G.edges(node, data=True))
+        if connected_edges:
+            lengths = [edge[2]['length'] for edge in connected_edges]
+            speeds = [float(edge[2]['speed_limit']) if edge[2]['speed_limit'].isdigit() else 50.0
+                      for edge in connected_edges]
+            avg_length = np.mean(lengths)
+            avg_speed = np.mean(speeds)
+        else:
+            avg_length = 0
+            avg_speed = 50.0
+        node_features = [avg_length, avg_speed] + features.tolist()
+        x.append(node_features)
+
+    x = torch.tensor(x, dtype=torch.float)
+
+    # Create PyTorch Geometric Data object
+    data = Data(x=x, edge_index=edge_index)
+
+    # Identify junctions (nodes with degree > 2)
+    degrees = dict(G.degree())
+    data.junction_mask = torch.tensor([degrees[node] > 2 for node in node_list], dtype=torch.bool)
+
+    # Store node IDs for mapping back
+    data.node_ids = node_list
+
+    return data
+
+
+class BusStopGNN(nn.Module):
+    """Graph Neural Network for bus stop prediction."""
+
+    def __init__(self, input_dim=6, hidden_dim=64):
+        super(BusStopGNN, self).__init__()
+        self.conv1 = SAGEConv(input_dim, hidden_dim)
+        self.bn1 = BatchNorm(hidden_dim)
+        self.conv2 = SAGEConv(hidden_dim, hidden_dim)
+        self.bn2 = BatchNorm(hidden_dim)
+        self.fc = nn.Linear(hidden_dim, 1)
+
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        x = self.conv1(x, edge_index)
+        x = self.bn1(x)
+        x = F.relu(x)
+        x = self.conv2(x, edge_index)
+        x = self.bn2(x)
+        x = F.relu(x)
+        x = self.fc(x)
+        return torch.sigmoid(x)
+
+
+def load_pretrained_model(path):
+    """Load the pre-trained GNN model from a .pkl file."""
+    with open(path, 'rb') as f:
+        model_state = pickle.load(f)
+    model = BusStopGNN(input_dim=6)  # Adjust input_dim if your model expects different features
+    model.load_state_dict(model_state['model_state_dict'])
+    model.eval()
+    return model
+
+
+def predict_bus_stops(model, data, road_nodes, threshold=0.7, min_distance=100):
+    """Predict new bus stops, avoiding junctions and ensuring minimum distance."""
+    with torch.no_grad():
+        probs = model(data).squeeze()
+
+    # Filter out junctions
+    valid_mask = ~data.junction_mask & (probs > threshold)
+    candidate_indices = torch.where(valid_mask)[0]
+    candidate_nodes = [data.node_ids[idx.item()] for idx in candidate_indices]
+    candidate_probs = probs[candidate_indices].numpy()
+
+    # Ensure bus stops are on drivable roads and maintain minimum distance
+    selected_stops = []
+    occupied_coords = set()
+
+    # Sort candidates by probability descending
+    sorted_candidates = sorted(zip(candidate_nodes, candidate_probs), key=lambda x: x[1], reverse=True)
+
+    for node_id, prob in sorted_candidates:
+        lat, lon = road_nodes.loc[node_id, ['y', 'x']]
+        point = Point(lon, lat)
+        too_close = False
+        for occ_lat, occ_lon in occupied_coords:
+            dist = ox.distance.great_circle(occ_lat, occ_lon, lat, lon)
+            if dist < min_distance:
+                too_close = True
+                break
+        if not too_close:
+            selected_stops.append((node_id, lat, lon, prob))
+            occupied_coords.add((lat, lon))
+
+    return selected_stops
 
 
 def main():
-    """Main execution flow"""
-    try:
-        # Initialize components
-        grids = DataLoader.load_grid_data("Training Data/city_grid_density.ods")
-        existing_stops = pd.read_excel("Training Data/stib_stops.ods", engine='odf')
-        existing_stops = gpd.GeoDataFrame(
-            existing_stops,
-            geometry=gpd.points_from_xy(
-                existing_stops['stop_lon'],
-                existing_stops['stop_lat']
-            ),
-            crs="EPSG:4326"
+    # Load data
+    city_grid_data = read_city_grid(GRID_FILE)
+    stib_stops_data = read_stib_stops(STOPS_FILE)
+    poi_names, poi_ranks = read_poi_tags(POI_TAGS_FILE)
+    tag_rank_mapping = dict(zip(poi_names, poi_ranks))
+    temperature, is_raining = get_weather(CITY_NAME, DATE_TIME)
+
+    if temperature is None:
+        print("Error fetching weather data.")
+        return
+
+    road_graph = download_road_network(CITY_NAME)
+    road_nodes, road_edges = validate_road_data(road_graph)
+
+    # Load pre-trained GNN model
+    model = load_pretrained_model(MODEL_SAVE_PATH)
+
+    # Process each grid and predict bus stops
+    all_predictions = []
+
+    for _, grid in city_grid_data.iterrows():
+        # Extract features
+        pois, poi_count = get_pois(
+            grid["min_lat"], grid["min_lon"],
+            grid["max_lat"], grid["max_lon"],
+            'amenity', tag_rank_mapping=tag_rank_mapping
         )
-        poi_processor = POIProcessor(DataLoader.load_poi_config("poi_tags.json"))
-        spatial_processor = SpatialProcessor()
-        output_generator = OutputGenerator()
+        density = grid['density_rank']
+        rain = 1 if is_raining else 0
+        features = normalize_features(density, poi_count, temperature, rain)
 
-        # Get environmental context
-        raining, temp = get_weather("Brussels")
-        is_day, is_peak = process_time("17:30")
+        # Construct graph for this grid
+        graph_data = construct_graph(road_nodes, road_edges, grid, features)
+        if graph_data is None:
+            print(
+                f"No road segments found in grid: {grid['min_lat']}-{grid['max_lat']}, {grid['min_lon']}-{grid['max_lon']}")
+            continue
 
-        # Prepare features and counts
-        features = []
-        poi_counts_list = []
+        # Predict bus stops
+        bus_stops = predict_bus_stops(model, graph_data, road_nodes)
 
-        logger.info("Processing grids...")
-        for idx, grid in tqdm(grids.iterrows(), total=len(grids)):
-            grid_geometry = box(
-                grid['min_lon'], grid['min_lat'],
-                grid['max_lon'], grid['max_lat']
-            )
+        # Add grid information to predictions
+        for stop in bus_stops:
+            node_id, lat, lon, prob = stop
+            all_predictions.append({
+                'grid_min_lat': grid['min_lat'],
+                'grid_max_lat': grid['max_lat'],
+                'grid_min_lon': grid['min_lon'],
+                'grid_max_lon': grid['max_lon'],
+                'node_id': node_id,
+                'latitude': lat,
+                'longitude': lon,
+                'probability': prob
+            })
 
-            pois = poi_processor.fetch_pois(grid)
-            poi_counts = poi_processor.count_pois(pois)
-            poi_counts_list.append(poi_counts)
+    # Save predictions to ODS
+    wb = Workbook()
+    ws = wb.active
+    ws.append(['Grid Min Lat', 'Grid Max Lat', 'Grid Min Lon', 'Grid Max Lon', 'Node ID', 'Latitude', 'Longitude',
+               'Probability'])
+    for pred in all_predictions:
+        ws.append([
+            pred['grid_min_lat'], pred['grid_max_lat'],
+            pred['grid_min_lon'], pred['grid_max_lon'],
+            pred['node_id'], pred['latitude'], pred['longitude'], pred['probability']
+        ])
+    wb.save("bus_stop_predictions.ods")
+    print("Predictions saved to 'bus_stop_predictions.ods'")
 
-            existing_count = existing_stops[existing_stops.geometry.within(grid_geometry)].shape[0]
-
-            features.append([
-                grid['population_density'],
-                sum(poi_counts.values()),  # Total POI count as feature
-                int(is_day),
-                int(is_peak),
-                int(raining),
-                temp,
-                existing_count
-            ])
-
-        # Prepare data for model
-        X = torch.tensor(StandardScaler().fit_transform(features), dtype=torch.float)
-        edge_index = spatial_processor.create_spatial_graph(grids)
-        y = synthetic_targets(grids)
-
-        # Train model
-        trainer = GNNTrainer(X.shape[1], CONFIG)
-        model = trainer.train(X, edge_index, y)
-
-        # Generate predictions
-        predictions = predict(model, X, edge_index)
-
-        # Generate candidate points
-        results = []
-        logger.info("Generating candidates...")
-        for idx, grid in tqdm(grids.iterrows(), total=len(grids)):
-            candidates = spatial_processor.generate_candidates(grid)
-            selected = []
-            current_counts = poi_counts_list[idx]
-
-            for candidate in candidates:
-                candidate_pt = Point(candidate['lon'], candidate['lat'])
-                distances = existing_stops.geometry.distance(candidate_pt)
-
-                if distances.min() > CONFIG["proximity_threshold"]:
-                    selected.append({
-                        **candidate,
-                        'score': predictions[idx],
-                        **current_counts  # Add POI counts to candidate data
-                    })
-
-            results.extend(selected[:predictions[idx]])
-
-        # Save results
-        results_df = pd.DataFrame(results)
-        output_generator.save_to_ods(results_df, "bus_stops.ods")
-        output_generator.create_map(results_df, grids, "bus_stops_map.html")
-
-    except Exception as e:
-        logger.error(f"Main execution failed: {str(e)}")
-        raise
-
-
-def synthetic_targets(grids: pd.DataFrame) -> torch.Tensor:
-    """Generate synthetic training targets"""
-    base = grids['population_density'].values * 0.7
-    noise = np.random.rand(len(grids)) * 0.3
-    return torch.tensor(np.clip(base + noise, 0, 3), dtype=torch.float)
-
-
-def predict(model: EnhancedGNN, X: torch.Tensor, edge_index: torch.Tensor) -> np.ndarray:
-    """Generate predictions from trained model"""
-    model.eval()
-    with torch.no_grad():
-        raw_pred = model(X, edge_index).squeeze().numpy()
-    return np.clip(raw_pred * 3, 0, 3).astype(int)
-
-
-def get_weather(city: str) -> Tuple[bool, float]:
-    # Load the API keys
-    with open('api_keys.json') as json_file:
-        api_keys = json.load(json_file)
-
-    # Google Maps API key
-    WEATHER_API_KEY = api_keys['Weather_API']['API_key']
-    """Get current weather conditions"""
-    try:
-        url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_API_KEY}"
-        response = requests.get(url).json()
-        temp = response['main']['temp'] - 273.15
-        raining = any('rain' in w['main'].lower() for w in response.get('weather', []))
-        return raining, temp
-    except Exception as e:
-        logger.error(f"Weather API error: {str(e)}")
-        return False, 20.0
-
-
-def process_time(time_str: str) -> Tuple[bool, bool]:
-    """Determine time-based features"""
-    try:
-        tz = pytz.timezone('Europe/Brussels')
-        current_time = datetime.now(tz).time()
-        is_day = 7 <= current_time.hour < 19
-        is_peak = (8 <= current_time.hour < 10) or (17 <= current_time.hour < 19)
-        return is_day, is_peak
-    except Exception as e:
-        logger.error(f"Time processing error: {str(e)}")
-        return True, False
+    # Display on Folium map
+    m = folium.Map(location=[50.8503, 4.3517], zoom_start=12)  # Center of Brussels
+    for pred in all_predictions:
+        folium.Marker(
+            [pred['latitude'], pred['longitude']],
+            popup=f"Prob: {pred['probability']:.2f}"
+        ).add_to(m)
+    m.save("bus_stop_predictions.html")
+    print("Map saved to 'bus_stop_predictions.html'")
 
 
 if __name__ == "__main__":
