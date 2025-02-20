@@ -34,7 +34,7 @@ np.random.seed(42)
 
 # Constants
 CITY_NAME = "Brussels"
-DATE_TIME = "2025-02-19 11:00"
+DATE_TIME = "2025-02-22 11:00"
 GRID_FILE = "Training Data/city_grid_density.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
@@ -46,7 +46,7 @@ CELL_SIZE = 500  # meters
 class BusStopPredictor(nn.Module):
     def __init__(self):
         super().__init__()
-        self.conv1 = SAGEConv(6, 64)  # Matches checkpoint input dimensions
+        self.conv1 = SAGEConv(4, 64)  # Matches checkpoint input dimensions
         self.bn1 = BatchNorm(64)
         self.conv2 = SAGEConv(64, 64)  # Matches hidden layer dimensions
         self.bn2 = BatchNorm(64)
@@ -243,6 +243,34 @@ def extract_grid_features(grid, pois_count, temperature, is_raining):
     return grid_features
 
 
+def _road_type_to_numeric(road_type):
+    """
+    Convert OSM highway types to numeric codes.
+    Handles both single values and lists (common in OSM data).
+    """
+    if isinstance(road_type, list):
+        road_type = road_type[0]  # Take first value if multiple exist
+
+    hierarchy = {
+        'motorway': 0,
+        'motorway_link': 0,
+        'trunk': 1,
+        'trunk_link': 1,
+        'primary': 2,
+        'primary_link': 2,
+        'secondary': 3,
+        'secondary_link': 3,
+        'tertiary': 4,
+        'tertiary_link': 4,
+        'unclassified': 5,
+        'residential': 6,
+        'service': 7,
+        'living_street': 8,
+        'pedestrian': 9
+    }
+    return hierarchy.get(road_type, 5)
+
+
 def download_road_network(place_name):
     print(f"Downloading road network data for {place_name}...")
 
@@ -259,18 +287,35 @@ def download_road_network(place_name):
     expanded_west = west - radius
 
     # Download the expanded graph
-    expanded_graph_ = ox.graph_from_bbox((expanded_north, expanded_south, expanded_east, expanded_west), network_type='drive', simplify=False)
+    expanded_graph_ = ox.graph_from_bbox(
+        (expanded_north, expanded_south, expanded_east, expanded_west),
+        network_type='drive',
+        simplify=False
+    )
 
-    # Explicitly add 'osmid' attribute to nodes (matches graph node IDs)
-    for node_id in expanded_graph_.nodes():
-        expanded_graph_.nodes[node_id]['osmid'] = node_id
+    # Update each node: preserve 'highway' along with x, y, and type_encoded.
+    for node_id in list(expanded_graph_.nodes()):
+        attrs = expanded_graph_.nodes[node_id]
 
-    # Explicitly add 'u' and 'v' attributes to edges
-    # Add 'u' and 'v' to edges using bulk operations
-    u_values = {(u, v, k): u for u, v, k in expanded_graph_.edges(keys=True)}
-    v_values = {(u, v, k): v for u, v, k in expanded_graph_.edges(keys=True)}
-    nx.set_edge_attributes(expanded_graph_, u_values, 'u')
-    nx.set_edge_attributes(expanded_graph_, v_values, 'v')
+        # Ensure coordinates exist. Use fallback to 'lon' and 'lat' if needed.
+        x_val = attrs.get('x')
+        y_val = attrs.get('y')
+        if x_val is None or y_val is None:
+            x_val = attrs.get('lon', 0.0)
+            y_val = attrs.get('lat', 0.0)
+
+        # Preserve highway attribute (or set a default) before clearing attributes.
+        highway_val = attrs.get('highway', 'unclassified')
+        type_encoded = _road_type_to_numeric(highway_val)
+
+        # Clear attributes and update with required ones, including highway.
+        expanded_graph_.nodes[node_id].clear()
+        expanded_graph_.nodes[node_id].update({
+            'x': x_val,
+            'y': y_val,
+            'type_encoded': type_encoded,
+            'highway': highway_val  # Preserve the highway attribute for candidate filtering.
+        })
 
     return expanded_graph_
 
@@ -335,55 +380,59 @@ def normalize_features(grid_features):
         'density_rank': MinMaxScaler(feature_range=(0, 1)).fit([[1], [10]]),
         'poi_score': MinMaxScaler(feature_range=(0, 1)).fit([[1], [1000]]),
         'temp': MinMaxScaler(feature_range=(0, 1)).fit([[3], [10]]),
-        'rain': lambda x: x,
-        # Add 2 more features (example - modify as needed)
-        'population': MinMaxScaler(feature_range=(0, 1)).fit([[0], [1]]),
-        'employment': MinMaxScaler(feature_range=(0, 1)).fit([[0], [1]])
+        'rain': lambda x: x
     }
 
     return torch.tensor([
         grid_features['density_rank'] / 10,
         grid_features['poi_score'] / 1000,
-        (grid_features['temp'] - 3) / 7,  # 3-10°C normalization
-        grid_features['rain'],
-        # Add 2 real features (e.g., population/employment data)
-        0.5,  # Placeholder 1
-        0.5   # Placeholder 2
+        grid_features['temp'],  # 3-10°C normalization
+        grid_features['rain']
     ], dtype=torch.float)
 
 
 def predict_stops(model, grid_data, road_graph, threshold=0.7):
     model.eval()
     with torch.no_grad():
-        # Convert road network to PyG Data
-        pyg_data = from_networkx(road_graph)
-        pyg_data.x = normalize_features(grid_data).repeat(pyg_data.num_nodes, 1)
+        # Clear edge attributes to ensure consistency for conversion
+        for u, v, k in road_graph.edges(keys=True):
+            road_graph.edges[u, v, k].clear()
 
-        # Make prediction
+        pyg_data = from_networkx(
+            road_graph,
+            group_node_attrs=['x', 'y', 'type_encoded']  # Must match cleaned node attributes
+        )
+        # Normalize the grid features and replicate them for each node
+        pyg_data.x = normalize_features(grid_data).repeat(pyg_data.num_nodes, 1)
+        # Run the model to get predictions; pred will be ordered as in sorted(road_graph.nodes())
         pred = model(pyg_data.x, pyg_data.edge_index)
 
-    # Get candidate positions (filter junctions and non-drivable roads)
+    # Get a sorted list of node identifiers (this is how from_networkx orders nodes)
+    node_list = sorted(road_graph.nodes())
+
+    # Define allowed highway types (expand as needed)
+    allowed_highways = ['primary', 'secondary', 'tertiary', 'residential', 'unclassified']
+
     candidates = []
-    for node in road_graph.nodes():
-        if road_graph.nodes[node].get('highway') in ['primary', 'secondary', 'tertiary']:
-            point = Point(road_graph.nodes[node]['x'], road_graph.nodes[node]['y'])
-            buffer = point.buffer(JUNCTION_BUFFER)
+    for idx, node in enumerate(node_list):
+        node_attrs = road_graph.nodes[node]
+        highway_val = node_attrs.get('highway', 'unclassified')
+        if highway_val not in allowed_highways:
+            continue
 
-            # Check if near junction
-            is_junction = False
-            for edge in road_graph.edges():
-                if node in edge[:2]:
-                    if len(list(road_graph.successors(node))) > 2:
-                        is_junction = True
-                        break
+        point = Point(node_attrs['x'], node_attrs['y'])
+        # Create a buffer to avoid junctions (convert meters to approx degrees)
+        node_buffer = point.buffer(JUNCTION_BUFFER / 111000)
 
-            if not is_junction and pred[node] > threshold:
-                candidates.append({
-                    'lat': road_graph.nodes[node]['y'],
-                    'lon': road_graph.nodes[node]['x'],
-                    'score': pred[node].item()
-                })
+        # Check if the node is a junction: if it has more than 2 outgoing edges
+        is_junction = (road_graph.out_degree(node) > 2)
 
+        if not is_junction and pred[idx] > threshold:
+            candidates.append({
+                'lat': node_attrs['y'],
+                'lon': node_attrs['x'],
+                'score': pred[idx].item()
+            })
     return candidates
 
 
@@ -460,15 +509,12 @@ def main():
             grid["max_lat"], grid["max_lon"],
             'amenity', tag_rank_mapping=tag_rank_mapping
         )
-        print(poi_count)
-    #     grid_features = extract_grid_features(grid, poi_count, temperature, is_raining)
-    #     print(grid_features)
-    #
-    #     # Predict stops for this grid
-    #     candidates = predict_stops(model, grid_features, road_)
-    #
+        grid_features = extract_grid_features(grid, poi_count, temperature, is_raining)
+        # Predict stops for this grid
+        candidates = predict_stops(model, grid_features, road_)
+        print(candidates)
     #     # Add grid info to predictions
-    #     for candidate in candidates:
+    #     for candidatea in candidates:
     #         candidate.update({
     #             'grid_min_lat': grid['min_lat'],
     #             'grid_max_lat': grid['max_lat'],
