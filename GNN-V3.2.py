@@ -512,18 +512,18 @@ def main():
         grid_features = extract_grid_features(grid, poi_count, temperature, is_raining)
         # Predict stops for this grid
         candidates = predict_stops(model, grid_features, road_)
-        print(candidates)
-    #     # Add grid info to predictions
-    #     for candidatea in candidates:
-    #         candidate.update({
-    #             'grid_min_lat': grid['min_lat'],
-    #             'grid_max_lat': grid['max_lat'],
-    #             'grid_min_lon': grid['min_lon'],
-    #             'grid_max_lon': grid['max_lon']
-    #         })
-    #
-    #     all_predictions.extend(candidates)
-    #
+       # Add grid info to predictions
+        for candidate in candidates:
+            candidate.update({
+                'grid_min_lat': grid['min_lat'],
+                'grid_max_lat': grid['max_lat'],
+                'grid_min_lon': grid['min_lon'],
+                'grid_max_lon': grid['max_lon']
+            })
+
+        all_predictions.extend(candidates)
+        print(all_predictions)
+
     #
     # if temperature is not None:
     #     print(f"\nWeather in {CITY_NAME} on {DATE_TIME}:")
