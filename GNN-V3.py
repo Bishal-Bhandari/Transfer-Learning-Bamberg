@@ -28,11 +28,11 @@ np.random.seed(42)
 
 # Constants
 CITY_NAME = "Brussels"
-DATE_TIME = "2025-02-15 11:00"
+DATE_TIME = "2025-02-20 11:00"
 GRID_FILE = "Training Data/city_grid_density.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
-MODEL_SAVE_PATH = "bus_stop_predictor.pkl"  # Updated to .pkl
+MODEL_SAVE_PATH = "Output/bus_stop_scaler.pkl"  # Updated to .pkl
 JUNCTION_BUFFER = 50  # meters
 CELL_SIZE = 500  # meters
 
@@ -303,13 +303,41 @@ class BusStopGNN(nn.Module):
 
 
 def load_pretrained_model(path):
-    """Load the pre-trained GNN model from a .pkl file."""
-    with open(path, 'rb') as f:
-        model_state = pickle.load(f)
-    model = BusStopGNN(input_dim=6)  # Adjust input_dim if your model expects different features
-    model.load_state_dict(model_state['model_state_dict'])
-    model.eval()
-    return model
+    """Load the pre-trained GNN model from a .pkl file, handling both pickle and PyTorch formats."""
+    try:
+        # First attempt to load as a PyTorch model (most common for neural networks)
+        model = BusStopGNN(input_dim=6)  # Initialize the model architecture
+        checkpoint = torch.load(path, map_location=torch.device('cpu'))  # Use CPU for generality
+
+        # Check if it's a state dict or a full model
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint)  # Assume it's just the state dict
+
+        model.eval()
+        print(f"Successfully loaded PyTorch model from {path}")
+        return model
+
+    except RuntimeError as e:
+        print(f"Failed to load as PyTorch model: {e}")
+        # Fallback to pickle loading
+        try:
+            with open(path, 'rb') as f:
+                model_state = pickle.load(f)
+            model = BusStopGNN(input_dim=6)
+            if isinstance(model_state, dict) and 'model_state_dict' in model_state:
+                model.load_state_dict(model_state['model_state_dict'])
+            else:
+                model.load_state_dict(model_state)
+            model.eval()
+            print(f"Successfully loaded pickle model from {path}")
+            return model
+        except Exception as pickle_e:
+            raise ValueError(f"Could not load model from {path}. Tried PyTorch and pickle formats.\n"
+                             f"PyTorch error: {e}\nPickle error: {pickle_e}")
+    except Exception as e:
+        raise ValueError(f"Unexpected error loading model from {path}: {e}")
 
 
 def predict_bus_stops(model, data, road_nodes, threshold=0.7, min_distance=100):
