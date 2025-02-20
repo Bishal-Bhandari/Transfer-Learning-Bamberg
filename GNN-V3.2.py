@@ -8,6 +8,7 @@ import osmnx as ox
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from shapely.geometry import Point, LineString
 import networkx as nx
+from sympy.physics.units import temperature
 from torch_geometric.nn import SAGEConv, BatchNorm
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,8 +36,7 @@ GRID_FILE = "Training Data/city_grid_density.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
 MODEL_SAVE_PATH = "Output/best_bus_stop_model.pth"
-SCALER_SAVE_PATH = "Output/bus_stop_scaler.pkl"
-OUTPUT_FILE = "Model Data/bus_stop_predictions.ods"
+OUTPUT_FILE = "Model Data/bus_stop_predictions.csv"
 DEFAULT_TEMP = 15.0  # Default temperature if API fails
 DEFAULT_RAIN = False
 JUNCTION_BUFFER = 50  # meters
@@ -157,10 +157,12 @@ def get_weather(city, date_time):
 
             return temperature, is_raining
         else:
-            return None, None  # Error in fetching current weather
+            temp = DEFAULT_TEMP
+            rain = DEFAULT_RAIN
+            return None, None
 
     else:
-        return None, None  # Past weather requires a paid plan
+        return None, None
 
 
 def aggregate_poi_ranks(pois, tag_rank_mapping, tag_key='amenity'):
@@ -450,7 +452,7 @@ def predict_stops(model, grid_data, road_graph, threshold=0.7):
 
 def save_predictions(predictions, filename):
     df = pd.DataFrame(predictions)
-    df.to_excel(filename, engine="odf")
+    df.to_csv(filename, index=False)
     print(f"Predictions saved to {filename}")
 
 
@@ -534,34 +536,33 @@ def main():
             })
 
         all_predictions.extend(candidates)
-        print(all_predictions)
 
-    #
-    # if temperature is not None:
-    #     print(f"\nWeather in {CITY_NAME} on {DATE_TIME}:")
-    #     print(f"Temperature: {temperature}°C")
-    #     print(f"Raining: {'Yes' if is_raining else 'No'}")
-    # else:
-    #     print("\nError: Unable to fetch weather for this date (historical data requires a paid plan).")
-    #
-    # # Save and visualize
-    # save_predictions(all_predictions, "Model Data/bus_stop_predictions.ods")
-    # map = create_map(all_predictions, city_center)
-    # map.save("Template/bus_stops_prediction_map.html")
-    #
-    # print("Prediction complete. Check .ods file and .html map")
-    #
-    # print("City Grid Data Sample:")
-    # print(city_grid_data.head())
-    #
-    # print("\nSTIB Stops Data Sample:")
-    # print(stib_stops_data.head())
-    #
-    # print("POI Names:")
-    # print(poi_names[:5])
-    #
-    # print("\nPOI Ranks:")
-    # print(poi_ranks[:5])
+
+    if temperature is not None:
+        print(f"\nWeather in {CITY_NAME} on {DATE_TIME}:")
+        print(f"Temperature: {temperature}°C")
+        print(f"Raining: {'Yes' if is_raining else 'No'}")
+    else:
+        print("\nError: Unable to fetch weather for this date (historical data requires a paid plan).")
+
+    # Save and visualize
+    save_predictions(all_predictions, OUTPUT_FILE)
+    map = create_map(all_predictions, city_center)
+    map.save("Template/bus_stops_prediction_map.html")
+
+    print("Prediction complete. Check .ods file and .html map")
+
+    print("City Grid Data Sample:")
+    print(city_grid_data.head())
+
+    print("\nSTIB Stops Data Sample:")
+    print(stib_stops_data.head())
+
+    print("POI Names:")
+    print(poi_names[:5])
+
+    print("\nPOI Ranks:")
+    print(poi_ranks[:5])
 
 if __name__ == "__main__":
     main()
