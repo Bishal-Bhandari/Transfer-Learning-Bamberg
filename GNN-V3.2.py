@@ -5,42 +5,54 @@ import requests
 import torch
 import numpy as np
 import osmnx as ox
-from torch_geometric.data import Data
-from torch_geometric.nn import SAGEConv, BatchNorm
-import torch.nn as nn
-import torch.nn.functional as F
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from shapely.geometry import Point, LineString
 import networkx as nx
 from torch_geometric.nn import SAGEConv, BatchNorm
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.preprocessing import StandardScaler
-from shapely.geometry import Polygon
-import geopandas as gpd
 import folium
-from torch_geometric.loader import DataLoader
-from sklearn.model_selection import train_test_split
 from torch_geometric.utils.convert import from_networkx
+from tqdm import tqdm
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
 
 # Load API keys
 with open('api_keys.json') as json_file:
     api_keys = json.load(json_file)
 API_KEY = api_keys['Weather_API']['API_key']
 
-# Reproducibility
-torch.manual_seed(42)
-np.random.seed(42)
-
 # Constants
 CITY_NAME = "Brussels"
-DATE_TIME = "2025-02-22 11:00"
+DATE_TIME = "2025-02-22 11:00"  # Updated to a valid date within 5 days
 GRID_FILE = "Training Data/city_grid_density.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
 MODEL_SAVE_PATH = "Output/best_bus_stop_model.pth"
+SCALER_SAVE_PATH = "Output/bus_stop_scaler.pkl"
+OUTPUT_FILE = "Model Data/bus_stop_predictions.ods"
+DEFAULT_TEMP = 15.0  # Default temperature if API fails
+DEFAULT_RAIN = False
 JUNCTION_BUFFER = 50  # meters
 CELL_SIZE = 500  # meters
+
+class Config:
+    CITY_NAME = "Brussels"
+    MIN_STOP_DISTANCE = 500  # meters
+    PREDICTION_THRESHOLD = 0.5
+    ROAD_TYPES = ['motorway', 'trunk', 'primary', 'secondary']
+
+ox.settings.log_console = True
+ox.settings.use_cache = True
+ox.settings.cache_folder = "osmnx_cache"  # Optional custom cache location
+tqdm.pandas()
+
 
 
 class BusStopPredictor(nn.Module):
