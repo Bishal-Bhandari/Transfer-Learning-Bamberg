@@ -458,7 +458,7 @@ def save_predictions(predictions, filename):
 
 def load_pretrained_model(path):
     model = BusStopPredictor()
-    pretrained_dict = torch.load(path)
+    pretrained_dict = torch.load(path, weights_only=True)
 
     # Handle DataParallel prefixes if present
     pretrained_dict = {k.replace('module.', ''): v for k, v in pretrained_dict.items()}
