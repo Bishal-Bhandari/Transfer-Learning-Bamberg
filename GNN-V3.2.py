@@ -611,6 +611,7 @@ def main():
     # Save and visualize
     save_predictions(all_predictions, OUTPUT_FILE)
     map_ = create_map(all_predictions, city_center, city_grid_data, stib_stops_data)
+    print("yes")
     map_.save("Template/bus_stops_prediction_map.html")
 
     print("Prediction complete.")
