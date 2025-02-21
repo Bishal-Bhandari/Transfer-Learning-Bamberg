@@ -400,7 +400,7 @@ def normalize_features(grid_features):
     poi_norm = scalers['poi_score'].transform([[grid_features['poi_score']]])[0, 0]
     temp_norm = scalers['temp'].transform([[grid_features['temp']]])[0, 0]
     rain_norm = scalers['rain'](grid_features['rain'])
-    print(density_norm,poi_norm,temp_norm,rain_norm)
+
     return torch.tensor([density_norm, poi_norm, temp_norm, rain_norm], dtype=torch.float)
 
 
@@ -485,21 +485,87 @@ def load_pretrained_model(path):
     return model
 
 
-def create_map(predictions, city_center):
-    m = folium.Map(location=city_center, zoom_start=12)
+def create_map(all_predictions, city_center, city_grid_data, existing_stops):
+    existing_stops = existing_stops.dropna(subset=['Latitude', 'Longitude'])
 
-    for idx, stop in enumerate(predictions):
-        folium.Marker(
-            location=[stop['lat'], stop['lon']],
-            popup=f"Score: {stop['score']:.2f}",
-            icon=folium.Icon(color='green' if stop['score'] > 0.7 else 'orange')
-        ).add_to(m)
+    predictions_df = pd.DataFrame(all_predictions)
+    predictions_df = predictions_df.dropna(subset=['lat', 'lon'])
+    predictions = predictions_df.dropna(subset=['Lat', 'Lon'])
+
+    existing_stops[['Latitude', 'Longitude']] = existing_stops[['Latitude', 'Longitude']].apply(pd.to_numeric,
+                                                                                                errors='coerce')
+    predictions[['Latitude', 'Longitude']] = predictions[['Lat', 'Lon']].apply(pd.to_numeric,
+                                                                                          errors='coerce')
+
+    avg_lat = np.mean([existing_stops.Latitude.mean(), predictions.Latitude.mean()])
+    avg_lon = np.mean([existing_stops.Longitude.mean(), predictions.Longitude.mean()])
+
+    if np.isnan(avg_lat) or np.isnan(avg_lon):
+        avg_lat, avg_lon = city_center
+
+    m = folium.Map(location=[avg_lat, avg_lon], zoom_start=14, tiles='CartoDB positron')
+
+    grid_layer = folium.FeatureGroup(name='Density Grid')
+    for _, grid in city_grid_data.iterrows():
+        if all(col in grid for col in ['min_lat', 'min_lon', 'max_lat', 'max_lon', 'density_rank']):
+            grid_layer.add_child(
+                folium.Rectangle(
+                    bounds=[[grid['min_lat'], grid['min_lon']],
+                            [grid['max_lat'], grid['max_lon']]],
+                    color='#ff0000',
+                    fill=True,
+                    fill_color='YlOrRd',
+                    fill_opacity=0.2 * grid['density_rank'],
+                    popup=f"Density Rank: {grid['density_rank']}"
+                )
+            )
+    m.add_child(grid_layer)
+
+    existing_layer = folium.FeatureGroup(name='Existing Stops')
+    for _, stop in existing_stops.iterrows():
+        existing_layer.add_child(
+            folium.CircleMarker(
+                location=[stop['Latitude'], stop['Longitude']],
+                radius=6,
+                color='#00cc00',
+                fill=True,
+                popup=f"Name: {stop.get('Stop_Name', 'N/A')}<br>"
+                      f"Density Rank: {stop['density_rank']}<br>"
+                      f"POI Count: {stop['POI_Count']}"
+            )
+        )
+    m.add_child(existing_layer)
+
+    pred_layer = folium.FeatureGroup(name='Predicted Stops')
+    for _, pred in predictions.iterrows():
+        pred_layer.add_child(
+            folium.CircleMarker(
+                location=[pred['Latitude'], pred['Longitude']],
+                radius=5 + 8 * pred['pred_prob'],
+                color='#0066cc',
+                fill=True,
+                fill_opacity=0.7,
+                popup=f"Probability: {pred['pred_prob']:.2f}<br>"
+                      f"Density Rank: {pred['density_rank']}<br>"
+                      f"POIs: {pred['POI_Count']}"
+            )
+        )
+    m.add_child(pred_layer)
+
+    folium.LayerControl(collapsed=False).add_to(m)
+    title_html = '''
+         <h3 align="center" style="font-size:16px"><b>Bus Stop Predictions</b></h3>
+         <div style="text-align:center;">
+             <span style="color: #00cc00;">■</span> Existing Stops &nbsp;
+             <span style="color: #0066cc;">■</span> Predicted Stops
+         </div>
+    '''
+    m.get_root().html.add_child(folium.Element(title_html))
 
     return m
 
 
 def main():
-    global features
     city_grid_data = read_city_grid(GRID_FILE)
     stib_stops_data = read_stib_stops(STOPS_FILE)
     poi_names, poi_ranks = read_poi_tags(POI_TAGS_FILE)
@@ -535,7 +601,6 @@ def main():
 
         all_predictions.extend(candidates)
 
-
     if temperature is not None:
         print(f"\nWeather in {CITY_NAME} on {DATE_TIME}:")
         print(f"Temperature: {temperature}°C")
@@ -545,7 +610,7 @@ def main():
 
     # Save and visualize
     save_predictions(all_predictions, OUTPUT_FILE)
-    map_ = create_map(all_predictions, city_center)
+    map_ = create_map(all_predictions, city_center, city_grid_data, stib_stops_data)
     map_.save("Template/bus_stops_prediction_map.html")
 
     print("Prediction complete.")
