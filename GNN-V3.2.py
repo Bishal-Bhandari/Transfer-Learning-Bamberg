@@ -31,16 +31,16 @@ API_KEY = api_keys['Weather_API']['API_key']
 
 # Constants
 CITY_NAME = "Brussels"
-DATE_TIME = "2025-02-22 11:00"  # Updated to a valid date within 5 days
+DATE_TIME = "2025-02-22 11:00"  # Valid date within 5 days
 GRID_FILE = "Training Data/city_grid_density.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
 MODEL_SAVE_PATH = "Output/best_bus_stop_model.pth"
 OUTPUT_FILE = "Model Data/bus_stop_predictions.csv"
-DEFAULT_TEMP = 15.0  # Default temperature if API fails
+DEFAULT_TEMP = 15.0
 DEFAULT_RAIN = False
-JUNCTION_BUFFER = 50  # meters
-CELL_SIZE = 500  # meters
+JUNCTION_BUFFER = 50
+CELL_SIZE = 500
 
 class Config:
     CITY_NAME = "Brussels"
@@ -50,7 +50,7 @@ class Config:
 
 ox.settings.log_console = True
 ox.settings.use_cache = True
-ox.settings.cache_folder = "osmnx_cache"  # Optional custom cache location
+ox.settings.cache_folder = "osmnx_cache"
 tqdm.pandas()
 
 
@@ -486,19 +486,22 @@ def load_pretrained_model(path):
 
 
 def create_map(all_predictions, city_center, city_grid_data, existing_stops):
+
+    if 'stop_lat' in existing_stops.columns and 'stop_lon' in existing_stops.columns:
+        existing_stops = existing_stops.rename(columns={'stop_lat': 'Latitude', 'stop_lon': 'Longitude'})
     existing_stops = existing_stops.dropna(subset=['Latitude', 'Longitude'])
 
     predictions_df = pd.DataFrame(all_predictions)
     predictions_df = predictions_df.dropna(subset=['lat', 'lon'])
-    predictions = predictions_df.dropna(subset=['Lat', 'Lon'])
+    predictions_df = predictions_df.rename(columns={'lat': 'Latitude', 'lon': 'Longitude'})
 
     existing_stops[['Latitude', 'Longitude']] = existing_stops[['Latitude', 'Longitude']].apply(pd.to_numeric,
                                                                                                 errors='coerce')
-    predictions[['Latitude', 'Longitude']] = predictions[['Lat', 'Lon']].apply(pd.to_numeric,
-                                                                                          errors='coerce')
+    predictions_df[['Latitude', 'Longitude']] = predictions_df[['Latitude', 'Longitude']].apply(pd.to_numeric,
+                                                                                                errors='coerce')
 
-    avg_lat = np.mean([existing_stops.Latitude.mean(), predictions.Latitude.mean()])
-    avg_lon = np.mean([existing_stops.Longitude.mean(), predictions.Longitude.mean()])
+    avg_lat = np.mean([existing_stops.Latitude.mean(), predictions_df.Latitude.mean()])
+    avg_lon = np.mean([existing_stops.Longitude.mean(), predictions_df.Longitude.mean()])
 
     if np.isnan(avg_lat) or np.isnan(avg_lon):
         avg_lat, avg_lon = city_center
@@ -530,24 +533,21 @@ def create_map(all_predictions, city_center, city_grid_data, existing_stops):
                 color='#00cc00',
                 fill=True,
                 popup=f"Name: {stop.get('Stop_Name', 'N/A')}<br>"
-                      f"Density Rank: {stop['density_rank']}<br>"
-                      f"POI Count: {stop['POI_Count']}"
             )
         )
     m.add_child(existing_layer)
 
     pred_layer = folium.FeatureGroup(name='Predicted Stops')
-    for _, pred in predictions.iterrows():
+    for _, pred in predictions_df.iterrows():
+        print(pred)
         pred_layer.add_child(
             folium.CircleMarker(
                 location=[pred['Latitude'], pred['Longitude']],
-                radius=5 + 8 * pred['pred_prob'],
+                radius=5 + 8 * pred['score'],
                 color='#0066cc',
                 fill=True,
                 fill_opacity=0.7,
-                popup=f"Probability: {pred['pred_prob']:.2f}<br>"
-                      f"Density Rank: {pred['density_rank']}<br>"
-                      f"POIs: {pred['POI_Count']}"
+                popup=f"Probability: {pred['score']:.2f}<br>"
             )
         )
     m.add_child(pred_layer)
