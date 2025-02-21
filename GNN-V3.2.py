@@ -1,5 +1,4 @@
 import datetime
-import matplotlib
 import pandas as pd
 import json
 import requests
@@ -18,9 +17,7 @@ import folium
 from torch_geometric.utils.convert import from_networkx
 from tqdm import tqdm
 import logging
-import tkinter as tk
 
-matplotlib.use('TkAgg')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -35,28 +32,28 @@ API_KEY = api_keys['Weather_API']['API_key']
 
 # Constants
 CITY_NAME = "Bamberg"
-DATE_TIME = "2025-02-22 11:00"  # Valid date within 5 days
+DATE_TIME = "2025-02-22 11:00"  # Updated to a valid date within 5 days
 GRID_FILE = "Training Data/city_grid_density_bamberg.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
 MODEL_SAVE_PATH = "Output/best_bus_stop_model.pth"
 OUTPUT_FILE = "Model Data/bus_stop_predictions.csv"
-DEFAULT_TEMP = 15.0
+DEFAULT_TEMP = 15.0  # Default temperature if API fails
 DEFAULT_RAIN = False
-
+JUNCTION_BUFFER = 50  # meters
+CELL_SIZE = 500  # meters
 
 class Config:
-    CITY_NAME = "Brussels"
-    MIN_STOP_DISTANCE = 500
-    PREDICTION_THRESHOLD = 0.7
+    CITY_NAME = "Bamberg"
+    MIN_STOP_DISTANCE = 500  # meters
+    PREDICTION_THRESHOLD = 0.65
     ROAD_TYPES = ['motorway', 'trunk', 'primary', 'secondary']
-    ALLOWED_HIGHWAYS = ['primary', 'secondary', 'tertiary', 'residential', 'unclassified']
-
 
 ox.settings.log_console = True
 ox.settings.use_cache = True
-ox.settings.cache_folder = "osmnx_cache"
+ox.settings.cache_folder = "osmnx_cache"  # Optional custom cache location
 tqdm.pandas()
+
 
 
 class BusStopPredictor(nn.Module):
@@ -80,46 +77,10 @@ class BusStopPredictor(nn.Module):
         return torch.sigmoid(x)
 
 
-def haversine(lat1, lon1, lat2, lon2):
-    """Calculate the distance in meters between two geographic points."""
-    R = 6371.0  # Earth radius in kilometers
-    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-    return R * c * 1000  # Convert to meters
-
-
-def filter_predictions(predictions, min_distance):
-    """Filter predictions to ensure minimum distance between stops."""
-    filtered = []
-    # Sort by descending score to keep highest first
-    sorted_preds = sorted(predictions, key=lambda x: x['score'], reverse=True)
-
-    for pred in sorted_preds:
-        lat1 = pred['lat']
-        lon1 = pred['lon']
-        keep = True
-
-        # Check against already kept predictions
-        for kept in filtered:
-            lat2 = kept['lat']
-            lon2 = kept['lon']
-            if haversine(lat1, lon1, lat2, lon2) < min_distance:
-                keep = False
-                break
-
-        if keep:
-            filtered.append(pred)
-
-    return filtered
-
-
 def read_city_grid(file_path):
     """ Reads and cleans city grid density data """
     df = pd.read_excel(file_path, engine="odf")
-    df = df[["min_lat", "max_lat", "min_lon", "max_lon", "density_rank"]].dropna()
+    df = df[["min_lat",	"max_lat",	"min_lon", "max_lon", "density_rank"]].dropna()
     return df
 
 
@@ -267,6 +228,7 @@ def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=50,
 
 
 def extract_grid_features(grid, pois_count, temperature, is_raining):
+
     # Extract density rank from grid data.
     # Use .get() to allow flexibility if grid is a dict; if it's a pd.Series, you could also use grid["density_rank"].
     density_rank = grid.get("density_rank", 0)
@@ -282,7 +244,7 @@ def extract_grid_features(grid, pois_count, temperature, is_raining):
     if is_raining:
         rain_val = 1
     else:
-        rain_val = 0
+        rain_val=0
 
     # Combine all features into a single dictionary.
     grid_features = {
@@ -335,9 +297,9 @@ def download_road_network(place_name):
     radius = 0
     # Expand the bounding box
     expanded_north = north + radius
-    expanded_south = south + radius
+    expanded_south = south - radius
     expanded_east = east + radius
-    expanded_west = west + radius
+    expanded_west = west - radius
 
     # Download the expanded graph
     expanded_graph_ = ox.graph_from_bbox(
@@ -429,7 +391,7 @@ def validate_road_data(road_data):
 
 def normalize_features(grid_features):
     scalers = {
-        'density_rank': MinMaxScaler(feature_range=(0, 1)).fit([[1], [5]]),
+        'density_rank': MinMaxScaler(feature_range=(0, 1)).fit([[1], [10]]),
         'poi_score': MinMaxScaler(feature_range=(0, 1)).fit([[1], [2000]]),
         'temp': MinMaxScaler(feature_range=(0, 1)).fit([[-10], [35]]),
         'rain': lambda x: x
@@ -443,51 +405,48 @@ def normalize_features(grid_features):
     return torch.tensor([density_norm, poi_norm, temp_norm, rain_norm], dtype=torch.float)
 
 
-def calculate_stop_score(grid_features):
-    """Calculate stop likelihood score using urban factors"""
-    # Normalize features manually
-    density_norm = grid_features['density_rank'] / 5.0  # Assuming 1-5 scale
-    poi_norm = grid_features['poi_score'] / 1000.0  # Scale POI scores
-    temp_norm = (grid_features['temp'] + 10) / 45.0  # Normalize temp between -10°C to 35°C
-    rain_norm = grid_features['rain']  # Binary 0/1
+def predict_stops(model, grid_data, road_graph, threshold=0.7):
+    model.eval()
+    with torch.no_grad():
+        # Clear edge attributes to ensure consistency for conversion
+        for u, v, k in road_graph.edges(keys=True):
+            road_graph.edges[u, v, k].clear()
 
-    # Weighted combination (adjust weights as needed)
-    score = (0.4 * density_norm +
-             0.3 * poi_norm +
-             0.2 * temp_norm -
-             0.1 * rain_norm)
+        pyg_data = from_networkx(
+            road_graph,
+            group_node_attrs=['x', 'y', 'type_encoded']  # Must match cleaned node attributes
+        )
+        # Normalize the grid features and replicate them for each node
+        pyg_data.x = normalize_features(grid_data).repeat(pyg_data.num_nodes, 1)
+        # Run the model to get predictions; pred will be ordered as in sorted(road_graph.nodes())
+        pred = model(pyg_data.x, pyg_data.edge_index)
 
-    return score
-
-
-def predict_stops(grid_data, road_graph):
-    """Predict stops based on urban factors without neural network"""
-    base_score = calculate_stop_score(grid_data)
-
+    # Get a sorted list of node identifiers (this is how from_networkx orders nodes)
     node_list = sorted(road_graph.nodes())
+
+    # Define allowed highway types (expand as needed)
+    allowed_highways = ['primary', 'secondary', 'tertiary', 'residential', 'unclassified']
+
     candidates = []
-
-    for node in node_list:
+    for idx, node in enumerate(node_list):
         node_attrs = road_graph.nodes[node]
-
-        # Filter by allowed road types
-        if node_attrs.get('highway', '') not in Config.ALLOWED_HIGHWAYS:
+        highway_val = node_attrs.get('highway', 'unclassified')
+        if highway_val not in allowed_highways:
             continue
 
-        # Filter out junctions
-        if road_graph.out_degree(node) > 2:
-            continue
+        point = Point(node_attrs['x'], node_attrs['y'])
+        # Create a buffer to avoid junctions (convert meters to approx degrees)
+        node_buffer = point.buffer(JUNCTION_BUFFER / 111000)
 
-        # Add small randomness to distribute stops
-        final_score = base_score * (0.9 + 0.2 * np.random.random())
+        # Check if the node is a junction: if it has more than 2 outgoing edges
+        is_junction = (road_graph.out_degree(node) > 2)
 
-        if final_score > Config.PREDICTION_THRESHOLD:
+        if not is_junction and pred[idx] > threshold:
             candidates.append({
                 'lat': node_attrs['y'],
                 'lon': node_attrs['x'],
-                'score': final_score
+                'score': pred[idx].item()
             })
-
     return candidates
 
 
@@ -527,13 +486,10 @@ def load_pretrained_model(path):
     return model
 
 
-def create_map(all_predictions, city_grid_data, city_center):
-    predictions_df = pd.DataFrame(all_predictions)
-    predictions_df = predictions_df.dropna(subset=['lat', 'lon'])
-    predictions_df = predictions_df.rename(columns={'lat': 'Latitude', 'lon': 'Longitude'})
+def create_map(all_predictions, city_center, city_grid_data):
 
-    predictions_df[['Latitude', 'Longitude']] = predictions_df[['Latitude', 'Longitude']].apply(pd.to_numeric,
-                                                                                                errors='coerce')
+    predictions_df = pd.DataFrame(all_predictions)
+    predictions = predictions_df.dropna(subset=['lat', 'lon'])
 
     avg_lat, avg_lon = city_center
 
@@ -546,20 +502,19 @@ def create_map(all_predictions, city_grid_data, city_center):
                 folium.Rectangle(
                     bounds=[[grid['min_lat'], grid['min_lon']],
                             [grid['max_lat'], grid['max_lon']]],
-                    color='#ff0000',
+                    color='#00c1ff',
                     fill=True,
                     fill_color='YlOrRd',
-                    fill_opacity=0.2 * grid['density_rank'],
-                    popup=f"Density Rank: {grid['density_rank']}"
+                    fill_opacity=0.2 * grid['density_rank']
                 )
             )
     m.add_child(grid_layer)
 
     pred_layer = folium.FeatureGroup(name='Predicted Stops')
-    for _, pred in predictions_df.iterrows():
+    for _, pred in predictions.iterrows():
         pred_layer.add_child(
             folium.CircleMarker(
-                location=[pred['Latitude'], pred['Longitude']],
+                location=[pred['lat'], pred['lon']],
                 radius=5 + 8 * pred['score'],
                 color='#0066cc',
                 fill=True,
@@ -617,6 +572,7 @@ def plot_predictions(city_grid_data, predictions):
 
 def main():
     city_grid_data = read_city_grid(GRID_FILE)
+    stib_stops_data = read_stib_stops(STOPS_FILE)
     poi_names, poi_ranks = read_poi_tags(POI_TAGS_FILE)
     tag_rank_mapping = dict(zip(poi_names, poi_ranks))
     temperature, is_raining = get_weather(CITY_NAME, DATE_TIME)
@@ -627,6 +583,7 @@ def main():
     model = load_pretrained_model(MODEL_SAVE_PATH)
     model.eval()
 
+    # Get city center for map
     city_center = [city_grid_data['min_lat'].mean(), city_grid_data['min_lon'].mean()]
 
     all_predictions = []
@@ -637,10 +594,9 @@ def main():
             'amenity', tag_rank_mapping=tag_rank_mapping
         )
         grid_features = extract_grid_features(grid, poi_count, temperature, is_raining)
-
-        candidates = predict_stops(grid_features, road_)
-
-        # Add grid info to predictions
+        # Predict stops for this grid
+        candidates = predict_stops(model, grid_features, road_)
+       # Add grid info to predictions
         for candidate in candidates:
             candidate.update({
                 'grid_min_lat': grid['min_lat'],
@@ -648,6 +604,7 @@ def main():
                 'grid_min_lon': grid['min_lon'],
                 'grid_max_lon': grid['max_lon']
             })
+
         all_predictions.extend(candidates)
 
     if temperature is not None:
@@ -657,19 +614,16 @@ def main():
     else:
         print("\nError: Unable to fetch weather for this date (historical data requires a paid plan).")
 
-    # all_predictions = filter_predictions(all_predictions, Config.MIN_STOP_DISTANCE)
-
     # Save and visualize
     save_predictions(all_predictions, OUTPUT_FILE)
 
-    map_ = create_map(all_predictions, city_grid_data, city_center)
+    map_ = create_map(all_predictions, city_center, city_grid_data)
     map_.save("Template/bus_stops_prediction_map.html")
 
     # Visualize using Matplotlib (static lightweight map)
     # plot_predictions(city_grid_data, all_predictions)
 
     print("Prediction complete.")
-
 
 if __name__ == "__main__":
     main()
