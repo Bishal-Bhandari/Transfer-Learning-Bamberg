@@ -389,20 +389,19 @@ def validate_road_data(road_data):
 
 
 def normalize_features(grid_features):
-    # Add 2 additional features (modify based on your actual data)
     scalers = {
         'density_rank': MinMaxScaler(feature_range=(0, 1)).fit([[1], [10]]),
-        'poi_score': MinMaxScaler(feature_range=(0, 1)).fit([[1], [1000]]),
-        'temp': MinMaxScaler(feature_range=(0, 1)).fit([[3], [10]]),
+        'poi_score': MinMaxScaler(feature_range=(0, 1)).fit([[1], [2000]]),
+        'temp': MinMaxScaler(feature_range=(0, 1)).fit([[-10], [35]]),
         'rain': lambda x: x
     }
 
-    return torch.tensor([
-        grid_features['density_rank'] / 10,
-        grid_features['poi_score'] / 1000,
-        grid_features['temp'],  # 3-10°C normalization
-        grid_features['rain']
-    ], dtype=torch.float)
+    density_norm = scalers['density_rank'].transform([[grid_features['density_rank']]])[0, 0]
+    poi_norm = scalers['poi_score'].transform([[grid_features['poi_score']]])[0, 0]
+    temp_norm = scalers['temp'].transform([[grid_features['temp']]])[0, 0]
+    rain_norm = scalers['rain'](grid_features['rain'])
+    print(density_norm,poi_norm,temp_norm,rain_norm)
+    return torch.tensor([density_norm, poi_norm, temp_norm, rain_norm], dtype=torch.float)
 
 
 def predict_stops(model, grid_data, road_graph, threshold=0.7):
@@ -515,7 +514,6 @@ def main():
 
     # Get city center for map
     city_center = [city_grid_data['min_lat'].mean(), city_grid_data['min_lon'].mean()]
-
     all_predictions = []
     for _, grid in city_grid_data.iterrows():
         pois, poi_count = get_pois(
@@ -547,22 +545,10 @@ def main():
 
     # Save and visualize
     save_predictions(all_predictions, OUTPUT_FILE)
-    map = create_map(all_predictions, city_center)
-    map.save("Template/bus_stops_prediction_map.html")
+    map_ = create_map(all_predictions, city_center)
+    map_.save("Template/bus_stops_prediction_map.html")
 
-    print("Prediction complete. Check .ods file and .html map")
-
-    print("City Grid Data Sample:")
-    print(city_grid_data.head())
-
-    print("\nSTIB Stops Data Sample:")
-    print(stib_stops_data.head())
-
-    print("POI Names:")
-    print(poi_names[:5])
-
-    print("\nPOI Ranks:")
-    print(poi_ranks[:5])
+    print("Prediction complete.")
 
 if __name__ == "__main__":
     main()
