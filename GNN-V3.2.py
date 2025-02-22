@@ -243,7 +243,7 @@ def haversine_distance(lat1, lon1, lat2, lon2):
 
 def filter_predicted_stops(predictions, date_time_str):
 
-    # Determine time fraction based on the given time-of-day.
+    # time fraction
     dt = datetime.datetime.strptime(date_time_str, "%Y-%m-%d %H:%M")
     hour = dt.hour
     if 6 <= hour < 10:
@@ -257,10 +257,10 @@ def filter_predicted_stops(predictions, date_time_str):
     else:
         time_fraction = 0.3
 
-    # Mapping of density rank to base keep fraction.
+    # Mapping of density.
     density_mapping = {5: 0.8, 4: 0.7, 3: 0.6, 2: 0.4, 1: 0.3}
 
-    # Group predictions by grid boundaries.
+
     grid_groups = {}
     for p in predictions:
         grid_key = (
