@@ -45,10 +45,11 @@ JUNCTION_BUFFER = 50  # meters
 CELL_SIZE = 500  # meters
 
 class Config:
+    DENSITY_MAP ={5: 1, 4: 0.8, 3: 0.7, 2: 0.5, 1: 0.3}
     CITY_NAME = "Bamberg"
     MIN_STOP_DISTANCE = 500  # meters
     PREDICTION_THRESHOLD = 0.65
-    RADIUS_ROAD = 0.01
+    RADIUS_ROAD = 0
     ROAD_TYPES = ['motorway', 'trunk', 'primary', 'secondary']
 
 ox.settings.log_console = True
@@ -241,9 +242,9 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     return R * c
 
 
-def filter_predicted_stops(predictions, date_time_str):
+def filter_by_grid_density_and_time(predictions, date_time_str):
 
-    # time fraction
+    # Determine time fraction based on the provided date-time.
     dt = datetime.datetime.strptime(date_time_str, "%Y-%m-%d %H:%M")
     hour = dt.hour
     if 6 <= hour < 10:
@@ -257,10 +258,10 @@ def filter_predicted_stops(predictions, date_time_str):
     else:
         time_fraction = 0.3
 
-    # Mapping of density.
-    density_mapping = {5: 0.8, 4: 0.7, 3: 0.6, 2: 0.4, 1: 0.3}
+    # Mapping of density rank to base keep fraction.
+    density_mapping = Config.DENSITY_MAP
 
-
+    # Group predictions by grid boundaries.
     grid_groups = {}
     for p in predictions:
         grid_key = (
@@ -273,19 +274,43 @@ def filter_predicted_stops(predictions, date_time_str):
 
     filtered_predictions = []
     for grid_key, group in grid_groups.items():
-        # Each candidate in the same grid is assumed to share the same density rank.
+        # Assume all candidates in the same grid share the same density rank.
         density = group[0].get('density_rank', 3)
         base_keep = density_mapping.get(density, 0.6)
-        # Combine the density and time influence (80% vs 20% weight).
+        # Compute the effective keep fraction with 80% influence from density and 20% from time.
         effective_keep_fraction = 0.8 * base_keep + 0.2 * time_fraction
 
-        # Sort the candidates by prediction score (highest first).
+        # Sort candidates in this grid by their prediction score (highest first).
         sorted_group = sorted(group, key=lambda x: x['score'], reverse=True)
-        # Compute the number of candidates to keep (ensure at least one is retained).
+        # Determine the number of candidates to keep (at least one).
         num_to_keep = max(1, int(round(effective_keep_fraction * len(sorted_group))))
         filtered_predictions.extend(sorted_group[:num_to_keep])
 
     return filtered_predictions
+
+
+def filter_predicted_stops(predictions, date_time_str):
+
+    # First, filter based on grid density and time.
+    filtered_predictions = filter_by_grid_density_and_time(predictions, date_time_str)
+
+    # Next, apply the global distance filtering (500 m threshold).
+    final_candidates = []
+    # Sort by prediction score descending.
+    sorted_candidates = sorted(filtered_predictions, key=lambda x: x['score'], reverse=True)
+
+    for candidate in sorted_candidates:
+        lat, lon = candidate['lat'], candidate['lon']
+        too_close = False
+        for selected in final_candidates:
+            sel_lat, sel_lon = selected['lat'], selected['lon']
+            if haversine_distance(lat, lon, sel_lat, sel_lon) < 200:
+                too_close = True
+                break
+        if not too_close:
+            final_candidates.append(candidate)
+
+    return final_candidates
 
 
 def extract_grid_features(grid, pois_count, temperature, is_raining):
@@ -495,6 +520,10 @@ def predict_stops(model, grid_data, road_graph, threshold=0.7):
         node_attrs = road_graph.nodes[node]
         highway_val = node_attrs.get('highway', 'unclassified')
         if highway_val not in allowed_highways:
+            continue
+
+        # Remove candidate if node is a dead end: check total degree
+        if road_graph.degree(node) <= 1:
             continue
 
         point = Point(node_attrs['x'], node_attrs['y'])
