@@ -493,7 +493,7 @@ def create_map(all_predictions, city_center, city_grid_data):
 
     avg_lat, avg_lon = city_center
 
-    m = folium.Map(location=[avg_lat, avg_lon], zoom_start=14, tiles='CartoDB positron')
+    m = folium.Map(location=[avg_lat, avg_lon], zoom_start=12, tiles=Config.CITY_NAME)
 
     grid_layer = folium.FeatureGroup(name='Density Grid')
     for _, grid in city_grid_data.iterrows():
