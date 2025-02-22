@@ -251,11 +251,11 @@ def train_model(model, data, epochs=500):
 
         if loss < best_loss:
             best_loss = loss
-            torch.save(model.state_dict(), 'best_model.pth')
+            torch.save(model.state_dict(), 'Misc_/best_model.pth')
 
         print(f'Epoch {epoch + 1}: Loss {loss.item():.4f}')
 
-    model.load_state_dict(torch.load('best_model.pth'))
+    model.load_state_dict(torch.load('Misc_/best_model.pth'))
     return model
 
 

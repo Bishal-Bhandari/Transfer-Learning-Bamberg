@@ -366,11 +366,11 @@ def save_predictions(predictions, output_file):
 # 9. Main Workflow
 def main():
     # Load Grid and Graph
-    grid_gdf = load_grid_data("Training Data/city_grid_density.ods")
+    grid_gdf = load_grid_data("../Training Data/city_grid_density.ods")
     graph = ox.graph_from_place("Brussels, Belgium", network_type='drive', simplify=True)
 
     # Load Bus Stops
-    bus_stops = load_bus_stops("Training Data/stib_stops.ods", grid_gdf, graph)
+    bus_stops = load_bus_stops("../Training Data/stib_stops.ods", grid_gdf, graph)
     pois = ox.features_from_place("Brussels, Belgium", tags={'amenity': True})
 
     # POI Counts for existing stops
@@ -419,7 +419,7 @@ def main():
     new_predictions = predictions_df[(~predictions_df['node_id'].isin(existing_node_ids)) & (
                 predictions_df['pred_prob'] > predictions_df['threshold'])]
 
-    save_predictions(new_predictions, 'Model Data/bus_stop_predictions.ods')
+    save_predictions(new_predictions, '../Model Data/bus_stop_predictions.ods')
 
     result_map = create_results_map(bus_stops, new_predictions, grid_gdf)
     result_map.save("Template/bus_stop_predictions_map.html")

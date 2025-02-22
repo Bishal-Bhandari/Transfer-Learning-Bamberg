@@ -29,18 +29,18 @@ torch.manual_seed(42)
 np.random.seed(42)
 
 # Load API keys
-with open('api_keys.json') as json_file:
+with open('../api_keys.json') as json_file:
     api_keys = json.load(json_file)
 API_KEY = api_keys['Weather_API']['API_key']
 
 # Constants
 CITY_NAME = "Bamberg"
 DATE_TIME = "2025-02-22 11:00"  # Valid date within 5 days
-GRID_FILE = "Training Data/city_grid_density_bamberg.ods"
-STOPS_FILE = "Training Data/stib_stops.ods"
-POI_TAGS_FILE = "poi_tags.json"
-MODEL_SAVE_PATH = "Output/best_bus_stop_model.pth"
-OUTPUT_FILE = "Model Data/bus_stop_predictions.csv"
+GRID_FILE = "../Training Data/city_grid_density_bamberg.ods"
+STOPS_FILE = "../Training Data/stib_stops.ods"
+POI_TAGS_FILE = "../poi_tags.json"
+MODEL_SAVE_PATH = "../Output/best_bus_stop_model.pth"
+OUTPUT_FILE = "../Model Data/bus_stop_predictions.csv"
 DEFAULT_TEMP = 15.0
 DEFAULT_RAIN = False
 
