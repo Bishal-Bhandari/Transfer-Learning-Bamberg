@@ -294,7 +294,7 @@ def download_road_network(place_name):
     # Get the bounding box of the city
     nodes = ox.graph_to_gdfs(graph_, nodes=True, edges=False)
     north, south, east, west = nodes.union_all().bounds
-    radius = 0
+    radius = 0.001
     # Expand the bounding box
     expanded_north = north + radius
     expanded_south = south - radius
@@ -493,7 +493,7 @@ def create_map(all_predictions, city_center, city_grid_data):
 
     avg_lat, avg_lon = city_center
 
-    m = folium.Map(location=[avg_lat, avg_lon], zoom_start=12, tiles=Config.CITY_NAME)
+    m = folium.Map(location=[avg_lat, avg_lon], zoom_start=12, tiles="OpenStreetMap")
 
     grid_layer = folium.FeatureGroup(name='Density Grid')
     for _, grid in city_grid_data.iterrows():
