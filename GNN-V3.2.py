@@ -47,6 +47,7 @@ class Config:
     CITY_NAME = "Bamberg"
     MIN_STOP_DISTANCE = 500  # meters
     PREDICTION_THRESHOLD = 0.65
+    RADIUS_ROAD = 0.01
     ROAD_TYPES = ['motorway', 'trunk', 'primary', 'secondary']
 
 ox.settings.log_console = True
@@ -294,7 +295,9 @@ def download_road_network(place_name):
     # Get the bounding box of the city
     nodes = ox.graph_to_gdfs(graph_, nodes=True, edges=False)
     north, south, east, west = nodes.union_all().bounds
-    radius = 0.001
+
+    radius = Config.RADIUS_ROAD
+
     # Expand the bounding box
     expanded_north = north + radius
     expanded_south = south - radius
