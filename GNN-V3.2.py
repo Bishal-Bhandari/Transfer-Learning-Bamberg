@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import requests
 import torch
+import math
 import numpy as np
 import osmnx as ox
 from matplotlib import pyplot as plt
@@ -32,7 +33,7 @@ API_KEY = api_keys['Weather_API']['API_key']
 
 # Constants
 CITY_NAME = "Bamberg"
-DATE_TIME = "2025-02-22 11:00"  # Updated to a valid date within 5 days
+DATE_TIME = "2025-02-23 09:00"  # Updated to a valid date within 5 days
 GRID_FILE = "Training Data/city_grid_density_bamberg.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
@@ -226,6 +227,65 @@ def get_pois(min_lat, min_lon, max_lat, max_lon, poi_type='amenity', timeout=50,
     except requests.exceptions.RequestException as e:
         print(f"Error making API request: {e}")
         return [], 0
+
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Compute the great circle distance between two points (in meters)."""
+    R = 6371000  # Earth radius in meters
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return R * c
+
+
+def filter_predicted_stops(predictions, date_time_str):
+
+    # Determine time fraction based on the given time-of-day.
+    dt = datetime.datetime.strptime(date_time_str, "%Y-%m-%d %H:%M")
+    hour = dt.hour
+    if 6 <= hour < 10:
+        time_fraction = 0.8
+    elif 10 <= hour < 16:
+        time_fraction = 0.6
+    elif 16 <= hour < 18:
+        time_fraction = 0.8
+    elif 18 <= hour < 22:
+        time_fraction = 0.8
+    else:
+        time_fraction = 0.3
+
+    # Mapping of density rank to base keep fraction.
+    density_mapping = {5: 0.8, 4: 0.7, 3: 0.6, 2: 0.4, 1: 0.3}
+
+    # Group predictions by grid boundaries.
+    grid_groups = {}
+    for p in predictions:
+        grid_key = (
+            p.get('grid_min_lat'),
+            p.get('grid_min_lon'),
+            p.get('grid_max_lat'),
+            p.get('grid_max_lon')
+        )
+        grid_groups.setdefault(grid_key, []).append(p)
+
+    filtered_predictions = []
+    for grid_key, group in grid_groups.items():
+        # Each candidate in the same grid is assumed to share the same density rank.
+        density = group[0].get('density_rank', 3)
+        base_keep = density_mapping.get(density, 0.6)
+        # Combine the density and time influence (80% vs 20% weight).
+        effective_keep_fraction = 0.8 * base_keep + 0.2 * time_fraction
+
+        # Sort the candidates by prediction score (highest first).
+        sorted_group = sorted(group, key=lambda x: x['score'], reverse=True)
+        # Compute the number of candidates to keep (ensure at least one is retained).
+        num_to_keep = max(1, int(round(effective_keep_fraction * len(sorted_group))))
+        filtered_predictions.extend(sorted_group[:num_to_keep])
+
+    return filtered_predictions
 
 
 def extract_grid_features(grid, pois_count, temperature, is_raining):
@@ -605,7 +665,8 @@ def main():
                 'grid_min_lat': grid['min_lat'],
                 'grid_max_lat': grid['max_lat'],
                 'grid_min_lon': grid['min_lon'],
-                'grid_max_lon': grid['max_lon']
+                'grid_max_lon': grid['max_lon'],
+                'density_rank': grid['density_rank']
             })
 
         all_predictions.extend(candidates)
@@ -617,10 +678,12 @@ def main():
     else:
         print("\nError: Unable to fetch weather for this date (historical data requires a paid plan).")
 
-    # Save and visualize
-    save_predictions(all_predictions, OUTPUT_FILE)
+    filtered_predictions = filter_predicted_stops(all_predictions, DATE_TIME)
 
-    map_ = create_map(all_predictions, city_center, city_grid_data)
+    # Save and visualize
+    save_predictions(filtered_predictions, OUTPUT_FILE)
+
+    map_ = create_map(filtered_predictions, city_center, city_grid_data)
     map_.save("Template/bus_stops_prediction_map.html")
 
     # Visualize using Matplotlib (static lightweight map)
