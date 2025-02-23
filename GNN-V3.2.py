@@ -33,7 +33,7 @@ API_KEY = api_keys['Weather_API']['API_key']
 
 # Constants
 CITY_NAME = "Bamberg"
-DATE_TIME = "2025-02-23 09:00"  # Updated to a valid date within 5 days
+DATE_TIME = "2025-02-24 09:00"  # Updated to a valid date within 5 days
 GRID_FILE = "Training Data/city_grid_density_bamberg.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
@@ -45,7 +45,7 @@ JUNCTION_BUFFER = 50  # meters
 CELL_SIZE = 500  # meters
 
 class Config:
-    DENSITY_MAP ={5: 1, 4: 0.8, 3: 0.7, 2: 0.5, 1: 0.3}
+    DENSITY_MAP ={5: 1, 4: 0.8, 3: 0.7, 2: 0.3, 1: 0.05}
     CITY_NAME = "Bamberg"
     MIN_STOP_DISTANCE = 500  # meters
     PREDICTION_THRESHOLD = 0.65
@@ -54,7 +54,7 @@ class Config:
 
 ox.settings.log_console = True
 ox.settings.use_cache = True
-ox.settings.cache_folder = "osmnx_cache"  # Optional custom cache location
+ox.settings.cache_folder = "osmnx_cache"
 tqdm.pandas()
 
 
@@ -250,7 +250,7 @@ def filter_by_grid_density_and_time(predictions, date_time_str):
     if 6 <= hour < 10:
         time_fraction = 1
     elif 10 <= hour < 16:
-        time_fraction = 0.8
+        time_fraction = 0.95
     elif 16 <= hour < 18:
         time_fraction = 0.9
     elif 18 <= hour < 22:
@@ -275,10 +275,12 @@ def filter_by_grid_density_and_time(predictions, date_time_str):
     filtered_predictions = []
     for grid_key, group in grid_groups.items():
         # Assume all candidates in the same grid share the same density rank.
+        print(group)
         density = group[0].get('density_rank', 3)
+        print(density)
         base_keep = density_mapping.get(density, 0.6)
-        # Compute the effective keep fraction with 80% influence from density and 20% from time.
-        effective_keep_fraction = 0.8 * base_keep + 0.2 * time_fraction
+        # Compute the effective keep fraction with 90% influence from density and 20% from time.
+        effective_keep_fraction = 0.9 * base_keep + 0.1 * time_fraction
 
         # Sort candidates in this grid by their prediction score (highest first).
         sorted_group = sorted(group, key=lambda x: x['score'], reverse=True)
@@ -304,7 +306,7 @@ def filter_predicted_stops(predictions, date_time_str):
         too_close = False
         for selected in final_candidates:
             sel_lat, sel_lon = selected['lat'], selected['lon']
-            if haversine_distance(lat, lon, sel_lat, sel_lon) < 200:
+            if haversine_distance(lat, lon, sel_lat, sel_lon) < 100:
                 too_close = True
                 break
         if not too_close:
@@ -707,7 +709,7 @@ def main():
     else:
         print("\nError: Unable to fetch weather for this date (historical data requires a paid plan).")
 
-    # all_predictions = filter_predicted_stops(all_predictions, DATE_TIME)
+    all_predictions = filter_predicted_stops(all_predictions, DATE_TIME)
 
     # Save and visualize
     save_predictions(all_predictions, OUTPUT_FILE)
