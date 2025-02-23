@@ -248,15 +248,15 @@ def filter_by_grid_density_and_time(predictions, date_time_str):
     dt = datetime.datetime.strptime(date_time_str, "%Y-%m-%d %H:%M")
     hour = dt.hour
     if 6 <= hour < 10:
-        time_fraction = 0.8
+        time_fraction = 1
     elif 10 <= hour < 16:
-        time_fraction = 0.6
-    elif 16 <= hour < 18:
         time_fraction = 0.8
+    elif 16 <= hour < 18:
+        time_fraction = 0.9
     elif 18 <= hour < 22:
         time_fraction = 0.8
     else:
-        time_fraction = 0.3
+        time_fraction = 0.5
 
     # Mapping of density rank to base keep fraction.
     density_mapping = Config.DENSITY_MAP
@@ -707,12 +707,12 @@ def main():
     else:
         print("\nError: Unable to fetch weather for this date (historical data requires a paid plan).")
 
-    filtered_predictions = filter_predicted_stops(all_predictions, DATE_TIME)
+    # all_predictions = filter_predicted_stops(all_predictions, DATE_TIME)
 
     # Save and visualize
-    save_predictions(filtered_predictions, OUTPUT_FILE)
+    save_predictions(all_predictions, OUTPUT_FILE)
 
-    map_ = create_map(filtered_predictions, city_center, city_grid_data)
+    map_ = create_map(all_predictions, city_center, city_grid_data)
     map_.save("Template/bus_stops_prediction_map.html")
 
     # Visualize using Matplotlib (static lightweight map)
