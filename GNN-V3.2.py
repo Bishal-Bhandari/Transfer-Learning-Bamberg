@@ -5,7 +5,6 @@ import requests
 import torch
 import math
 import numpy as np
-import osmnx as ox
 from matplotlib import pyplot as plt
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from shapely.geometry import Point, LineString
@@ -18,7 +17,19 @@ import folium
 from torch_geometric.utils.convert import from_networkx
 from tqdm import tqdm
 import logging
+import osmnx as ox
+import osmnx as ox
+import geopandas as gpd
+from shapely.geometry import box
+from shapely.ops import unary_union
 
+# Configure OSMnx settings FIRST
+ox.settings.log_console = True  # Enable OSMnx logging
+ox.settings.use_cache = True    # Enable caching
+ox.settings.cache_folder = "osmnx_cache_bamberg" # Custom cache folder
+tqdm.pandas()                   # Enable tqdm for pandas
+
+# Then configure other settings
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -49,13 +60,9 @@ class Config:
     CITY_NAME = "Bamberg"
     MIN_STOP_DISTANCE = 500  # meters
     PREDICTION_THRESHOLD = 0.65
-    RADIUS_ROAD = 0
+    RADIUS_ROAD_NETWORK = 0
     ROAD_TYPES = ['motorway', 'trunk', 'primary', 'secondary']
 
-ox.settings.log_console = True
-ox.settings.use_cache = True
-ox.settings.cache_folder = "osmnx_cache"
-tqdm.pandas()
 
 
 
@@ -275,9 +282,7 @@ def filter_by_grid_density_and_time(predictions, date_time_str):
     filtered_predictions = []
     for grid_key, group in grid_groups.items():
         # Assume all candidates in the same grid share the same density rank.
-        print(group)
         density = group[0].get('density_rank', 3)
-        print(density)
         base_keep = density_mapping.get(density, 0.6)
         # Compute the effective keep fraction with 90% influence from density and 20% from time.
         effective_keep_fraction = 0.9 * base_keep + 0.1 * time_fraction
@@ -377,13 +382,13 @@ def _road_type_to_numeric(road_type):
 def download_road_network(place_name):
     print(f"Downloading road network data for {place_name}...")
 
-    graph_ = ox.graph_from_place(place_name, network_type='drive', simplify=False)
+    expanded_graph_ = ox.graph_from_place(place_name, network_type='drive', simplify=False)
 
     # Get the bounding box of the city
-    nodes = ox.graph_to_gdfs(graph_, nodes=True, edges=False)
-    north, south, east, west = nodes.union_all().bounds
-
-    radius = Config.RADIUS_ROAD
+    nodes = ox.graph_to_gdfs(expanded_graph_, nodes=True, edges=False)
+    west, south, east, north = nodes.union_all().bounds
+    print(west, south, east, north)
+    radius = Config.RADIUS_ROAD_NETWORK
 
     # Expand the bounding box
     expanded_north = north + radius
@@ -395,7 +400,7 @@ def download_road_network(place_name):
     expanded_graph_ = ox.graph_from_bbox(
         (expanded_north, expanded_south, expanded_east, expanded_west),
         network_type='drive',
-        simplify=False
+        simplify=True
     )
 
     # Update each node: preserve 'highway' along with x, y, and type_encoded.
@@ -423,60 +428,6 @@ def download_road_network(place_name):
         })
 
     return expanded_graph_
-
-
-def validate_road_data(road_data):
-    missing_info = []
-    # If input is a NetworkX graph:
-    if isinstance(road_data, nx.Graph):
-        try:
-            nodes, edges = ox.graph_to_gdfs(road_data)
-        except Exception as e:
-            raise ValueError(f"Error converting graph to GeoDataFrames: {e}")
-    elif isinstance(road_data, dict):
-        if not all(k in road_data for k in ['nodes', 'edges']):
-            raise ValueError("Input dict must contain keys 'nodes' and 'edges'.")
-        nodes = road_data['nodes']
-        edges = road_data['edges']
-    else:
-        raise ValueError("road_data must be a NetworkX graph or a dict with 'nodes' and 'edges'.")
-
-    # Check for node identifier
-    if 'osmid' not in nodes.columns and 'id' not in nodes.columns:
-        # Fallback: use the index as identifier and add a column
-        nodes = nodes.copy()
-        nodes['osmid'] = nodes.index
-        print("Node identifier not found; using index as 'osmid'.")
-
-    # Ensure required node columns exist
-    required_node_cols = ['geometry', 'x', 'y']
-    for col in required_node_cols:
-        if col not in nodes.columns:
-            missing_info.append(f"Missing '{col}' in nodes.")
-
-    # For edges, check for 'u' and 'v'
-    if 'u' not in edges.columns or 'v' not in edges.columns:
-        # Fallback: if edges index is a MultiIndex or tuple, try to extract u and v
-        def extract_uv(row):
-            # If the index of the row is a tuple of length >=2, use its first two elements.
-            if isinstance(row.name, tuple) and len(row.name) >= 2:
-                return pd.Series({'u': row.name[0], 'v': row.name[1]})
-            else:
-                return pd.Series({'u': None, 'v': None})
-
-        uv = edges.apply(extract_uv, axis=1)
-        if uv['u'].isna().all() or uv['v'].isna().all():
-            missing_info.append("Missing 'u' and 'v' in edges and could not be inferred.")
-        else:
-            edges = edges.join(uv)
-            print("Edge identifiers 'u' and 'v' were missing; inferred from index.")
-
-    # If any missing info remains, raise error with details.
-    if missing_info:
-        raise ValueError("Road data is missing required fields:\n" + "\n".join(missing_info))
-
-    print("Road data validation passed.")
-    return nodes, edges
 
 
 def normalize_features(grid_features):
