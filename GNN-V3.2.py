@@ -58,7 +58,7 @@ CELL_SIZE = 500  # meters
 class Config:
     DENSITY_MAP ={5: 1, 4: 0.8, 3: 0.7, 2: 0.0, 1: 0.0}
     CITY_NAME = "Bamberg"
-    MIN_STOP_DISTANCE = 150  # meters
+    MIN_STOP_DISTANCE = 300  # meters
     PREDICTION_THRESHOLD = 0.65
     RADIUS_ROAD_NETWORK = 0
     ROAD_TYPES = ['motorway', 'trunk', 'primary', 'secondary']
@@ -266,8 +266,6 @@ def filter_by_grid_density_and_time(predictions, date_time_str):
     else:
         time_fraction = 0.5
 
-    # Mapping of density rank to base keep fraction.
-    density_mapping = Config.DENSITY_MAP
 
     # Group predictions by grid boundaries.
     grid_groups = {}
@@ -283,8 +281,8 @@ def filter_by_grid_density_and_time(predictions, date_time_str):
     filtered_predictions = []
     for grid_key, group in grid_groups.items():
         # Assume all candidates in the same grid share the same density rank.
-        density = group[0].get('density_rank', 3)
-        base_keep = density_mapping.get(density, 0.6)
+        density = int(group[0].get('density_rank', 3))
+        base_keep = Config.DENSITY_MAP.get(density, 0.6)
         effective_keep_fraction = 0.9 * base_keep + 0.1 * time_fraction
         # Sort candidates in this grid by their prediction score (highest first).
         sorted_group = sorted(group, key=lambda x: x['score'], reverse=True)
