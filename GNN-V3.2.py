@@ -44,7 +44,7 @@ API_KEY = api_keys['Weather_API']['API_key']
 
 # Constants
 CITY_NAME = "Bamberg"
-DATE_TIME = "2025-02-24 09:00"  # Updated to a valid date within 5 days
+DATE_TIME = "2025-02-27 09:00"  # Updated to a valid date within 5 days
 GRID_FILE = "Training Data/city_grid_density_bamberg.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
@@ -56,9 +56,9 @@ JUNCTION_BUFFER = 50  # meters
 CELL_SIZE = 500  # meters
 
 class Config:
-    DENSITY_MAP ={5: 1, 4: 0.8, 3: 0.7, 2: 0.3, 1: 0.05}
+    DENSITY_MAP ={5: 1, 4: 0.8, 3: 0.7, 2: 0.0, 1: 0.0}
     CITY_NAME = "Bamberg"
-    MIN_STOP_DISTANCE = 500  # meters
+    MIN_STOP_DISTANCE = 150  # meters
     PREDICTION_THRESHOLD = 0.65
     RADIUS_ROAD_NETWORK = 0
     ROAD_TYPES = ['motorway', 'trunk', 'primary', 'secondary']
@@ -91,6 +91,7 @@ def read_city_grid(file_path):
     """ Reads and cleans city grid density data """
     df = pd.read_excel(file_path, engine="odf")
     df = df[["min_lat",	"max_lat",	"min_lon", "max_lon", "density_rank"]].dropna()
+    df['density_rank'] = df['density_rank'].astype(int)
     return df
 
 
@@ -284,9 +285,7 @@ def filter_by_grid_density_and_time(predictions, date_time_str):
         # Assume all candidates in the same grid share the same density rank.
         density = group[0].get('density_rank', 3)
         base_keep = density_mapping.get(density, 0.6)
-        # Compute the effective keep fraction with 90% influence from density and 20% from time.
         effective_keep_fraction = 0.9 * base_keep + 0.1 * time_fraction
-
         # Sort candidates in this grid by their prediction score (highest first).
         sorted_group = sorted(group, key=lambda x: x['score'], reverse=True)
         # Determine the number of candidates to keep (at least one).
@@ -311,7 +310,7 @@ def filter_predicted_stops(predictions, date_time_str):
         too_close = False
         for selected in final_candidates:
             sel_lat, sel_lon = selected['lat'], selected['lon']
-            if haversine_distance(lat, lon, sel_lat, sel_lon) < 100:
+            if haversine_distance(lat, lon, sel_lat, sel_lon) < Config.MIN_STOP_DISTANCE:
                 too_close = True
                 break
         if not too_close:
@@ -384,24 +383,24 @@ def download_road_network(place_name):
 
     expanded_graph_ = ox.graph_from_place(place_name, network_type='drive', simplify=False)
 
-    # Get the bounding box of the city
-    nodes = ox.graph_to_gdfs(expanded_graph_, nodes=True, edges=False)
-    west, south, east, north = nodes.union_all().bounds
-    print(west, south, east, north)
-    radius = Config.RADIUS_ROAD_NETWORK
-
-    # Expand the bounding box
-    expanded_north = north + radius
-    expanded_south = south - radius
-    expanded_east = east + radius
-    expanded_west = west - radius
-
-    # Download the expanded graph
-    expanded_graph_ = ox.graph_from_bbox(
-        (expanded_north, expanded_south, expanded_east, expanded_west),
-        network_type='drive',
-        simplify=True
-    )
+    # # Get the bounding box of the city
+    # nodes = ox.graph_to_gdfs(expanded_graph_, nodes=True, edges=False)
+    # west, south, east, north = nodes.union_all().bounds
+    # print(west, south, east, north)
+    # radius = Config.RADIUS_ROAD_NETWORK
+    #
+    # # Expand the bounding box
+    # expanded_north = north + radius
+    # expanded_south = south - radius
+    # expanded_east = east + radius
+    # expanded_west = west - radius
+    #
+    # # Download the expanded graph
+    # expanded_graph_ = ox.graph_from_bbox(
+    #     (expanded_north, expanded_south, expanded_east, expanded_west),
+    #     network_type='drive',
+    #     simplify=True
+    # )
 
     # Update each node: preserve 'highway' along with x, y, and type_encoded.
     for node_id in list(expanded_graph_.nodes()):
