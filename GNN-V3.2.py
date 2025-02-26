@@ -56,7 +56,7 @@ JUNCTION_BUFFER = 50  # meters
 CELL_SIZE = 500  # meters
 
 class Config:
-    DENSITY_MAP ={5: 1, 4: 0.8, 3: 0.7, 2: 0.3, 1: 0.2}
+    DENSITY_MAP ={5: 1, 4: 0.8, 3: 0.7, 2: 0.2, 1: 0.1}
     CITY_NAME = "Bamberg"
     MIN_STOP_DISTANCE = 400  # meters
     PREDICTION_THRESHOLD = 0.65
@@ -697,11 +697,12 @@ def main():
 
 
     all_predictions = filter_predicted_stops(all_predictions, DATE_TIME)
+    for item in all_predictions:
     # Save and visualize
     save_predictions(all_predictions, OUTPUT_FILE)
 
     map_ = create_map(all_predictions, city_center, city_grid_data)
-    map_.save("Template/bus_stops_prediction_map.html")
+    map_.save("Template/bus_stops_prediction_map_bamberg.html")
 
     # Visualize using Matplotlib (static lightweight map)
     # plot_predictions(city_grid_data, all_predictions)
