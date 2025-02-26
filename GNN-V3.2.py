@@ -443,7 +443,14 @@ def normalize_features(grid_features):
     return torch.tensor([density_norm, poi_norm, temp_norm, rain_norm], dtype=torch.float)
 
 
-def predict_stops(model, grid_data, road_graph, threshold=0.7):
+def predict_stops(model, grid_data, road_graph):
+
+    if grid_data['density_rank'] <= 2:
+        threshold = 0.5  # Lower threshold for low density areas
+    elif grid_data['density_rank'] == 3:
+        threshold = 0.6  # Medium threshold for medium density
+    else:
+        threshold = 0.7
 
     model.eval()
     with torch.no_grad():
