@@ -697,7 +697,7 @@ def main():
 
 
     all_predictions = filter_predicted_stops(all_predictions, DATE_TIME)
-    for item in all_predictions:
+
     # Save and visualize
     save_predictions(all_predictions, OUTPUT_FILE)
 
