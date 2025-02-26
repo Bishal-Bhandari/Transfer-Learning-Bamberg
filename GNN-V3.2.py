@@ -56,9 +56,9 @@ JUNCTION_BUFFER = 50  # meters
 CELL_SIZE = 500  # meters
 
 class Config:
-    DENSITY_MAP ={5: 1, 4: 0.8, 3: 0.7, 2: 0.4, 1: 0.3}
+    DENSITY_MAP ={5: 1, 4: 0.8, 3: 0.7, 2: 0.3, 1: 0.2}
     CITY_NAME = "Bamberg"
-    MIN_STOP_DISTANCE = 300  # meters
+    MIN_STOP_DISTANCE = 400  # meters
     PREDICTION_THRESHOLD = 0.65
     RADIUS_ROAD_NETWORK = 0
     ROAD_TYPES = ['motorway', 'trunk', 'primary', 'secondary']
@@ -446,11 +446,12 @@ def normalize_features(grid_features):
 def predict_stops(model, grid_data, road_graph):
 
     if grid_data['density_rank'] <= 2:
-        threshold = 0.5  # Lower threshold for low density areas
+        threshold = 0.4  # Lower threshold for low density areas
     elif grid_data['density_rank'] == 3:
-        threshold = 0.6  # Medium threshold for medium density
+        threshold = 0.55  # Medium threshold for medium density
     else:
-        threshold = 0.7
+        threshold = 0.6
+
 
     model.eval()
     with torch.no_grad():
@@ -466,7 +467,6 @@ def predict_stops(model, grid_data, road_graph):
         pyg_data.x = normalize_features(grid_data).repeat(pyg_data.num_nodes, 1)
         # Run the model to get predictions; pred will be ordered as in sorted(road_graph.nodes())
         pred = model(pyg_data.x, pyg_data.edge_index)
-
     # Get a sorted list of node identifiers (this is how from_networkx orders nodes)
     node_list = sorted(road_graph.nodes())
 
@@ -476,6 +476,7 @@ def predict_stops(model, grid_data, road_graph):
     candidates = []
     for idx, node in enumerate(node_list):
         node_attrs = road_graph.nodes[node]
+
         highway_val = node_attrs.get('highway', 'unclassified')
         if highway_val not in allowed_highways:
             continue
@@ -626,9 +627,6 @@ def main():
     poi_names, poi_ranks = read_poi_tags(POI_TAGS_FILE)
     tag_rank_mapping = dict(zip(poi_names, poi_ranks))
     temperature, is_raining = get_weather(CITY_NAME, DATE_TIME)
-    # At the start of main() after loading data
-    print("Total number of grids:", len(city_grid_data))
-    print("Density rank distribution:", city_grid_data['density_rank'].value_counts().sort_index())
 
     road_ = download_road_network(CITY_NAME)
 
@@ -658,8 +656,6 @@ def main():
 
         # Skip grids with no roads
         if len(grid_nodes) == 0:
-            print(
-                f"Skipping grid with bounds {grid['min_lat']},{grid['min_lon']} to {grid['max_lat']},{grid['max_lon']} (no roads found)")
             continue
 
         grid_road_network = road_.subgraph(grid_nodes).copy()
@@ -671,8 +667,6 @@ def main():
         )
 
         if not has_required_attrs:
-            print(
-                f"Skipping grid with bounds {grid['min_lat']},{grid['min_lon']} to {grid['max_lat']},{grid['max_lon']} (missing node attributes)")
             continue
 
         # Now use the grid-specific network for prediction
@@ -691,8 +685,6 @@ def main():
 
             all_predictions.extend(candidates)
         except Exception as e:
-            print(
-                f"Error processing grid with bounds {grid['min_lat']},{grid['min_lon']} to {grid['max_lat']},{grid['max_lon']}: {e}")
             continue
 
 
@@ -703,8 +695,6 @@ def main():
     else:
         print("\nError: Unable to fetch weather for this date (historical data requires a paid plan).")
 
-    for item in all_predictions:
-        print(item["density_rank"])
 
     all_predictions = filter_predicted_stops(all_predictions, DATE_TIME)
     # Save and visualize
