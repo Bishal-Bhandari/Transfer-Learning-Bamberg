@@ -56,7 +56,7 @@ JUNCTION_BUFFER = 50  # meters
 CELL_SIZE = 500  # meters
 
 class Config:
-    DENSITY_MAP ={5: 1, 4: 0.8, 3: 0.7, 2: 0.0, 1: 0.0}
+    DENSITY_MAP ={5: 1, 4: 0.8, 3: 0.7, 2: 0.4, 1: 0.3}
     CITY_NAME = "Bamberg"
     MIN_STOP_DISTANCE = 300  # meters
     PREDICTION_THRESHOLD = 0.65
@@ -321,7 +321,7 @@ def extract_grid_features(grid, pois_count, temperature, is_raining):
 
     # Extract density rank from grid data.
     # Use .get() to allow flexibility if grid is a dict; if it's a pd.Series, you could also use grid["density_rank"].
-    density_rank = grid.get("density_rank", 0)
+    density_rank = int(grid.get("density_rank", 3))
 
     # Construct grid_data with geographic boundaries and density rank.
     grid_data = {
@@ -429,7 +429,7 @@ def download_road_network(place_name):
 
 def normalize_features(grid_features):
     scalers = {
-        'density_rank': MinMaxScaler(feature_range=(0, 1)).fit([[1], [10]]),
+        'density_rank': MinMaxScaler(feature_range=(0, 1)).fit([[1], [5]]),
         'poi_score': MinMaxScaler(feature_range=(0, 1)).fit([[1], [2000]]),
         'temp': MinMaxScaler(feature_range=(0, 1)).fit([[-10], [35]]),
         'rain': lambda x: x
@@ -444,6 +444,7 @@ def normalize_features(grid_features):
 
 
 def predict_stops(model, grid_data, road_graph, threshold=0.7):
+
     model.eval()
     with torch.no_grad():
         # Clear edge attributes to ensure consistency for conversion
@@ -618,6 +619,9 @@ def main():
     poi_names, poi_ranks = read_poi_tags(POI_TAGS_FILE)
     tag_rank_mapping = dict(zip(poi_names, poi_ranks))
     temperature, is_raining = get_weather(CITY_NAME, DATE_TIME)
+    # At the start of main() after loading data
+    print("Total number of grids:", len(city_grid_data))
+    print("Density rank distribution:", city_grid_data['density_rank'].value_counts().sort_index())
 
     road_ = download_road_network(CITY_NAME)
 
@@ -636,19 +640,54 @@ def main():
             'amenity', tag_rank_mapping=tag_rank_mapping
         )
         grid_features = extract_grid_features(grid, poi_count, temperature, is_raining)
-        # Predict stops for this grid
-        candidates = predict_stops(model, grid_features, road_)
-       # Add grid info to predictions
-        for candidate in candidates:
-            candidate.update({
-                'grid_min_lat': grid['min_lat'],
-                'grid_max_lat': grid['max_lat'],
-                'grid_min_lon': grid['min_lon'],
-                'grid_max_lon': grid['max_lon'],
-                'density_rank': grid['density_rank']
-            })
 
-        all_predictions.extend(candidates)
+        # Add this code to filter the road network by grid before prediction
+        grid_boundary = box(grid["min_lon"], grid["min_lat"], grid["max_lon"], grid["max_lat"])
+        grid_nodes = []
+
+        for node, data in road_.nodes(data=True):
+            if grid_boundary.contains(Point(data['x'], data['y'])):
+                grid_nodes.append(node)
+
+        # Skip grids with no roads
+        if len(grid_nodes) == 0:
+            print(
+                f"Skipping grid with bounds {grid['min_lat']},{grid['min_lon']} to {grid['max_lat']},{grid['max_lon']} (no roads found)")
+            continue
+
+        grid_road_network = road_.subgraph(grid_nodes).copy()
+
+        # Check if the subgraph has the required node attributes
+        has_required_attrs = all(
+            all(attr in data for attr in ['x', 'y', 'type_encoded'])
+            for _, data in grid_road_network.nodes(data=True)
+        )
+
+        if not has_required_attrs:
+            print(
+                f"Skipping grid with bounds {grid['min_lat']},{grid['min_lon']} to {grid['max_lat']},{grid['max_lon']} (missing node attributes)")
+            continue
+
+        # Now use the grid-specific network for prediction
+        try:
+            candidates = predict_stops(model, grid_features, grid_road_network)
+
+            # Add grid info to predictions
+            for candidate in candidates:
+                candidate.update({
+                    'grid_min_lat': grid['min_lat'],
+                    'grid_max_lat': grid['max_lat'],
+                    'grid_min_lon': grid['min_lon'],
+                    'grid_max_lon': grid['max_lon'],
+                    'density_rank': grid['density_rank']
+                })
+
+            all_predictions.extend(candidates)
+        except Exception as e:
+            print(
+                f"Error processing grid with bounds {grid['min_lat']},{grid['min_lon']} to {grid['max_lat']},{grid['max_lon']}: {e}")
+            continue
+
 
     if temperature is not None:
         print(f"\nWeather in {CITY_NAME} on {DATE_TIME}:")
@@ -657,8 +696,10 @@ def main():
     else:
         print("\nError: Unable to fetch weather for this date (historical data requires a paid plan).")
 
-    all_predictions = filter_predicted_stops(all_predictions, DATE_TIME)
+    for item in all_predictions:
+        print(item["density_rank"])
 
+    all_predictions = filter_predicted_stops(all_predictions, DATE_TIME)
     # Save and visualize
     save_predictions(all_predictions, OUTPUT_FILE)
 
