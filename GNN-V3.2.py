@@ -50,6 +50,7 @@ STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
 MODEL_SAVE_PATH = "Output/best_bus_stop_model.pth"
 OUTPUT_FILE = "Model Data/bus_stop_predictions.csv"
+DEFAULT_TEMP = 15
 DEFAULT_RAIN = False
 JUNCTION_BUFFER = 50  # m
 CELL_SIZE = 500  # m
