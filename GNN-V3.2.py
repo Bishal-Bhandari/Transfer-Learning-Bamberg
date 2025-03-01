@@ -44,21 +44,20 @@ API_KEY = api_keys['Weather_API']['API_key']
 
 # Constants
 CITY_NAME = "Bamberg"
-DATE_TIME = "2025-03-03 09:00"  # Updated to a valid date within 5 days
+DATE_TIME = "2025-03-03 09:00"  # Valid date within 5 days
 GRID_FILE = "Training Data/city_grid_density_bamberg.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
 MODEL_SAVE_PATH = "Output/best_bus_stop_model.pth"
 OUTPUT_FILE = "Model Data/bus_stop_predictions.csv"
-DEFAULT_TEMP = 15.0  # Default temperature if API fails
 DEFAULT_RAIN = False
-JUNCTION_BUFFER = 50  # meters
-CELL_SIZE = 500  # meters
+JUNCTION_BUFFER = 50  # m
+CELL_SIZE = 500  # m
 
 class Config:
     DENSITY_MAP ={5: 1, 4: 0.8, 3: 0.7, 2: 0.2, 1: 0.1}
     CITY_NAME = "Bamberg"
-    MIN_STOP_DISTANCE = 300  # meters
+    MIN_STOP_DISTANCE = 300  # m
     PREDICTION_THRESHOLD = 0.65
     RADIUS_ROAD_NETWORK = 0
     ROAD_TYPES = ['motorway', 'trunk', 'primary', 'secondary']
