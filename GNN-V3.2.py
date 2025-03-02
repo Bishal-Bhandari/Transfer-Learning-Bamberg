@@ -537,7 +537,7 @@ def create_map(all_predictions, city_center, city_grid_data):
                             [grid['max_lat'], grid['max_lon']]],
                     color='#00ff00',
                     fill=True,
-                    fill_color='YlOrRd',
+                    fill_color='Greens',
                     fill_opacity=0.2 * grid['density_rank']
                 )
             )
