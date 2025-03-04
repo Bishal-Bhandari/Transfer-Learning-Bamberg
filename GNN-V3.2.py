@@ -18,7 +18,6 @@ from torch_geometric.utils.convert import from_networkx
 from tqdm import tqdm
 import logging
 import osmnx as ox
-import osmnx as ox
 import geopandas as gpd
 from shapely.geometry import box
 from shapely.ops import unary_union
@@ -44,7 +43,7 @@ API_KEY = api_keys['Weather_API']['API_key']
 
 # Constants
 CITY_NAME = "Bamberg"
-DATE_TIME = "2025-03-03 09:00"  # Valid date within 5 days
+DATE_TIME = "2025-03-05 09:00"  # Valid date within 5 days
 GRID_FILE = "Training Data/city_grid_density_bamberg.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
@@ -58,7 +57,7 @@ CELL_SIZE = 500  # m
 class Config:
     DENSITY_MAP ={5: 1, 4: 0.8, 3: 0.7, 2: 0.2, 1: 0.1}
     CITY_NAME = "Bamberg"
-    MIN_STOP_DISTANCE = 300  # m
+    MIN_STOP_DISTANCE = 200  # m
     PREDICTION_THRESHOLD = 0.65
     RADIUS_ROAD_NETWORK = 0
     ROAD_TYPES = ['motorway', 'trunk', 'primary', 'secondary']
