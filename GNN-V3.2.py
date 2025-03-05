@@ -57,7 +57,7 @@ CELL_SIZE = 500  # m
 class Config:
     DENSITY_MAP ={5: 1, 4: 0.8, 3: 0.7, 2: 0.2, 1: 0.1}
     CITY_NAME = "Bamberg"
-    MIN_STOP_DISTANCE = 200  # m
+    MIN_STOP_DISTANCE = 300  # m
     PREDICTION_THRESHOLD = 0.65
     RADIUS_ROAD_NETWORK = 0
     ROAD_TYPES = ['motorway', 'trunk', 'primary', 'secondary']
@@ -536,7 +536,7 @@ def create_map(all_predictions, city_center, city_grid_data):
                             [grid['max_lat'], grid['max_lon']]],
                     color='#00ff00',
                     fill=True,
-                    fill_color='Greens',
+                    fill_color='red',
                     fill_opacity=0.2 * grid['density_rank']
                 )
             )
