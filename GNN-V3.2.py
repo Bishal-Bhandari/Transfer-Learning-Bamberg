@@ -560,7 +560,6 @@ def create_map(all_predictions, city_center, city_grid_data):
     title_html = '''
          <h3 align="center" style="font-size:16px"><b>Bus Stop Predictions</b></h3>
          <div style="text-align:center;">
-             <span style="color: #00cc00;">■</span> Existing Stops &nbsp;
              <span style="color: #0066cc;">■</span> Predicted Stops
          </div>
     '''
