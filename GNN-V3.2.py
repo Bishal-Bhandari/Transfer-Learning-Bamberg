@@ -43,7 +43,7 @@ API_KEY = api_keys['Weather_API']['API_key']
 
 # Constants
 CITY_NAME = "Bamberg"
-DATE_TIME = "2025-03-20 09:00"  # Valid date within 5 days
+DATE_TIME = "2025-03-22 09:00"  # Valid date within 5 days
 GRID_FILE = "Training Data/city_grid_density_bamberg.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
