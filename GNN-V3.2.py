@@ -57,7 +57,7 @@ CELL_SIZE = 500  # m
 class Config:
     DENSITY_MAP ={5: 1, 4: 0.8, 3: 0.7, 2: 0.2, 1: 0.1}
     CITY_NAME = "Bamberg"
-    MIN_STOP_DISTANCE = 300  # m
+    MIN_STOP_DISTANCE = 200  # m
     PREDICTION_THRESHOLD = 0.65
     RADIUS_ROAD_NETWORK = 0
     ROAD_TYPES = ['motorway', 'trunk', 'primary', 'secondary']
