@@ -671,7 +671,7 @@ def main():
         print("\nError: Unable to get weather for this date (historical data requires a paid plan).")
 
 
-    #all_predictions = filter_predicted_stops(all_predictions, DATE_TIME)
+    all_predictions = filter_predicted_stops(all_predictions, DATE_TIME)
 
     # Save and visualize
     save_predictions(all_predictions, OUTPUT_FILE)
