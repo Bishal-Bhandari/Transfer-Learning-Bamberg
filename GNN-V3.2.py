@@ -43,7 +43,7 @@ API_KEY = api_keys['Weather_API']['API_key']
 
 # Constants
 CITY_NAME = "Bamberg"
-DATE_TIME = "2025-03-22 09:00"  # Valid date within 5 days
+DATE_TIME = "2025-03-26 09:00"  # Valid date within 5 days
 GRID_FILE = "Training Data/city_grid_density_bamberg.ods"
 STOPS_FILE = "Training Data/stib_stops.ods"
 POI_TAGS_FILE = "poi_tags.json"
@@ -671,13 +671,13 @@ def main():
         print("\nError: Unable to get weather for this date (historical data requires a paid plan).")
 
 
-    all_predictions = filter_predicted_stops(all_predictions, DATE_TIME)
+    #all_predictions = filter_predicted_stops(all_predictions, DATE_TIME)
 
     # Save and visualize
     save_predictions(all_predictions, OUTPUT_FILE)
 
     map_ = create_map(all_predictions, city_center, city_grid_data)
-    map_.save("Template/bus_stops_prediction_map_bamberg.html")
+    map_.save("Template/bus_stops_prediction_map_bamberg1.html")
 
     # plot_predictions(city_grid_data, all_predictions)
 
