@@ -8,8 +8,6 @@ import numpy as np
 from matplotlib import pyplot as plt
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from shapely.geometry import Point, LineString
-import networkx as nx
-from sympy.physics.units import temperature
 from torch_geometric.nn import SAGEConv, BatchNorm
 import torch.nn as nn
 import torch.nn.functional as F
