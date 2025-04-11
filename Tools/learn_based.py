@@ -112,7 +112,7 @@ def train_model(features, edge_index, labels, num_epochs=1000):
 
         if acc > best_acc:
             best_acc = acc
-            torch.save(model.state_dict(), 'Output/best_bus_stop_model.pth')
+            torch.save(model.state_dict(), '../Output/best_bus_stop_model.pth')
 
         if epoch % 20 == 0:
             print(f'Epoch {epoch:03d} | Loss: {loss:.4f} | Val Acc: {acc:.4f}')
@@ -131,7 +131,7 @@ def predict_new_stop(new_coords, graph_data, model_path='Output/best_bus_stop_mo
     model = BusStopGNN(input_dim=6, hidden_dim=64, output_dim=1)
     model.load_state_dict(torch.load(model_path))
     model.eval()
-    scaler = joblib.load('Output/bus_stop_scaler.pkl')
+    scaler = joblib.load('../Output/bus_stop_scaler.pkl')
 
     # Preprocess new data
     scaled_coords = scaler.transform([new_coords])
@@ -171,7 +171,7 @@ if __name__ == "__main__":
     features, edge_index, scaler, labels = prepare_data(bus_stops)
 
     # Save the scaler for future predictions
-    joblib.dump(scaler, 'Output/bus_stop_scaler.pkl')
+    joblib.dump(scaler, '../Output/bus_stop_scaler.pkl')
 
     # Train the model and obtain graph data
     trained_model, graph_data = train_model(features, edge_index, labels)

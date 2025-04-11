@@ -251,11 +251,11 @@ def train_model(model, data, epochs=500):
 
         if loss < best_loss:
             best_loss = loss
-            torch.save(model.state_dict(), 'Misc_/best_model.pth')
+            torch.save(model.state_dict(), '../Misc_/best_model.pth')
 
         print(f'Epoch {epoch + 1}: Loss {loss.item():.4f}')
 
-    model.load_state_dict(torch.load('Misc_/best_model.pth'))
+    model.load_state_dict(torch.load('../Misc_/best_model.pth'))
     return model
 
 
@@ -360,9 +360,9 @@ def save_predictions(predictions, output_file):
 
 # 9. Main Workflow
 def main():
-    grid_gdf = load_grid_data("Training Data/city_grid_density.ods")
+    grid_gdf = load_grid_data("../Training Data/city_grid_density.ods")
     graph = ox.graph_from_place("Brussels, Belgium", network_type='drive', simplify=True)
-    bus_stops = load_bus_stops("Training Data/stib_stops.ods", grid_gdf, graph)
+    bus_stops = load_bus_stops("../Training Data/stib_stops.ods", grid_gdf, graph)
     pois = ox.features_from_place("Brussels, Belgium", tags={'amenity': True})
 
     bus_stops = calculate_poi_density(bus_stops, pois)
@@ -424,7 +424,7 @@ def main():
 
     final_predictions = pd.concat(final_selection)
 
-    save_predictions(new_predictions, 'Model Data/bus_stop_predictions.ods')
+    save_predictions(new_predictions, '../Model Data/bus_stop_predictions.ods')
 
     result_map = create_results_map(
         bus_stops,
